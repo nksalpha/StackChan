@@ -30,6 +30,18 @@
 - 원본 펌웨어는 공식 서버에 붙어 있었을 가능성이 높다. 재현 문서에도 원본에서는 OTA URL을 바꾸는 경로를 찾지 못했다고 적혀 있다.
 - 공식 서버는 ASR과 TTS를 스트리밍으로 처리한다. 지금 NAS 서버는 Deepgram을 REST로 호출해서, 말이 끝나고 나서야 인식 결과가 나온다.
 
+## 측정 도구 (2026-11-05 추가)
+
+절차는 `docs/MEASURE.md`에 있다.
+
+- `tools/serial_capture.py`: PC에서 시리얼 로그를 받아 기기가 붙는 서버 주소를 골라낸다.
+- `tools/collect_server.sh`: NAS에서 `docker logs -t` 로그와 설정(키는 가림)을 모은다.
+- `tools/latency_report.py`: 모은 로그로 턴마다 구간별 지연(ms)을 표로 낸다.
+
+서버 로그 자체 시각은 초 단위라서 `docker logs -t`의 시각을 기준으로 쓴다. 기준 로그 문구는 xinnan-tech/xiaozhi-esp32-server main(2026-11-05 커밋 4f6e9ec)에서 확인했다.
+
+확인 필요: 위 최신 서버 코드에는 Deepgram ASR 제공자가 없다. NAS 서버가 Deepgram을 어떻게 붙여 쓰고 있는지(포크, 직접 추가, OpenAI 호환 방식 등)를 수집한 설정 파일로 확인해야 한다.
+
 ## 다음에 할 일
 
 1. 원본 FW가 어느 서버에 붙는지 확인한다. 원본 FW로 부팅한 상태에서 시리얼 로그(115200bps)를 보면 OTA/WebSocket 주소가 나온다. 가설이 맞는지는 여기서 갈린다.
