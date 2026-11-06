@@ -147,10 +147,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..4d088cd
+index 0000000..b0da161
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,900 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -168,6 +168,7 @@ index 0000000..4d088cd
 +#include "settings.h"
 +
 +#include <cJSON.h>
++#include <esp_heap_caps.h>
 +#include <esp_log.h>
 +#include <esp_opus_dec.h>
 +#include <esp_pthread.h>
@@ -327,6 +328,7 @@ index 0000000..4d088cd
 +    auto cfg = esp_pthread_get_default_config();
 +    cfg.stack_size = 10 * 1024;
 +    cfg.prio = 1;  // 음성 처리(opus_codec 2, audio_afe 3)보다 낮게: TLS 연결 중에도 음성이 밀리지 않게
++    cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;  // 내부 RAM 아끼기
 +    cfg.thread_name = "direct_llm";
 +    esp_pthread_set_cfg(&cfg);
 +    llm_thread_ = std::thread([this]() { LlmLoop(); });
@@ -335,6 +337,7 @@ index 0000000..4d088cd
 +    tts_thread_ = std::thread([this]() { TtsLoop(); });
 +    cfg.stack_size = 4 * 1024;
 +    cfg.prio = 5;
++    cfg.stack_alloc_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 +    cfg.thread_name = "direct_play";
 +    esp_pthread_set_cfg(&cfg);
 +    player_thread_ = std::thread([this]() { PlayerLoop(); });
@@ -523,7 +526,7 @@ index 0000000..4d088cd
 +        std::lock_guard<std::mutex> lock(mutex_);
 +        llm_jobs_.clear();
 +        tts_jobs_.clear();
-+        packets_.clear();
++        chunks_.clear();
 +    }
 +    cv_.notify_all();
 +}
@@ -598,14 +601,17 @@ index 0000000..4d088cd
 +        if (voice) {
 +            last_voice_us_ = now;
 +            had_voice_ = true;
++            finalize_sent_ = false;  // 다시 말하기 시작하면 다음 무음에서 또 마무리할 수 있게
 +            return;
 +        }
 +        have_text = !utterance_.empty() || !interim_.empty();
-+        if (!had_voice_ || finalize_sent_ || !have_text) return;
++        // 글자가 아직 안 왔어도 Deepgram이 받은 음성으로 마무리하게 한다
++        if (!had_voice_ || finalize_sent_) return;
 +        if (now - last_voice_us_ < 500 * 1000) return;
 +        finalize_sent_ = true;
 +    }
-+    ESP_LOGI(TAG, "ASR +%lld ms device VAD silence, Finalize", (now - listen_start_us_) / 1000);
++    ESP_LOGI(TAG, "ASR +%lld ms device VAD silence, Finalize%s", (now - listen_start_us_) / 1000,
++             have_text ? "" : " (no text yet)");
 +    std::unique_lock<std::mutex> lock(ws_mutex_, std::try_to_lock);
 +    if (lock.owns_lock() && asr_ws_ && asr_ws_->IsConnected()) {
 +        asr_ws_->Send(std::string("{\"type\":\"Finalize\"}"));
@@ -738,6 +744,7 @@ index 0000000..4d088cd
 +
 +    std::string line_buf, text_buf, full_reply;
 +    bool emotion_done = false, first_sentence = true, first_token = true;
++    size_t reasoning_chars = 0;  // 생각(추론) 단계가 있는 모델이면 여기로 먼저 온다
 +    char buf[512];
 +    bool done = false;
 +
@@ -773,10 +780,13 @@ index 0000000..4d088cd
 +            auto c0 = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
 +            auto delta = c0 ? cJSON_GetObjectItem(c0, "delta") : nullptr;
 +            auto content = delta ? cJSON_GetObjectItem(delta, "content") : nullptr;
++            auto reasoning = delta ? cJSON_GetObjectItem(delta, "reasoning_content") : nullptr;
++            if (cJSON_IsString(reasoning)) reasoning_chars += strlen(reasoning->valuestring);
 +            if (cJSON_IsString(content) && content->valuestring[0]) {
 +                if (first_token) {
 +                    first_token = false;
-+                    ESP_LOGI(TAG, "LAT llm_first_token=%lld ms", (esp_timer_get_time() - t0) / 1000);
++                    ESP_LOGI(TAG, "LAT llm_first_token=%lld ms (reasoning chars before: %u)",
++                             (esp_timer_get_time() - t0) / 1000, (unsigned)reasoning_chars);
 +                }
 +                text_buf += content->valuestring;
 +            }
@@ -884,7 +894,10 @@ index 0000000..4d088cd
 +            if (job.last) {
 +                // 마지막 표시만 넘겨서 재생 쪽이 턴을 끝낼 수 있게 한다
 +                std::lock_guard<std::mutex> lock(mutex_);
-+                packets_.push_back({job.turn, kTtsSampleRate, 20, {}, true});
++                Chunk c;
++                c.turn = job.turn;
++                c.last = true;
++                chunks_.push_back(std::move(c));
 +                cv_.notify_all();
 +            }
 +        }
@@ -953,23 +966,30 @@ index 0000000..4d088cd
 +    cJSON_Delete(j);
 +    if (!IsCurrent(turn)) return true;
 +
-+    std::vector<Packet> out;
++    Chunk chunk;
++    chunk.turn = turn;
++    chunk.sample_rate = kTtsSampleRate;
++    chunk.data.reserve(ogg.size());   // 1KB 넘는 할당은 PSRAM으로 간다
++    chunk.frames.reserve(512);
 +    OggDemuxer demuxer;
 +    demuxer.OnPacket([&](const uint8_t* data, int sample_rate, int frame_duration_ms, size_t size) {
-+        out.push_back({turn, sample_rate, frame_duration_ms,
-+                       std::vector<uint8_t>(data, data + size), false});
++        chunk.sample_rate = sample_rate;
++        chunk.frames.push_back({(uint32_t)chunk.data.size(), (uint16_t)size, (uint16_t)frame_duration_ms});
++        chunk.data.insert(chunk.data.end(), data, data + size);
 +    });
 +    demuxer.Reset();
 +    demuxer.Process(ogg.data(), ogg.size());
++    ogg.clear();
++    ogg.shrink_to_fit();
 +    ESP_LOGI(TAG, "LAT tts http=%lld ms total=%lld ms packets=%u chars=%u",
-+             (t_http - t0) / 1000, (esp_timer_get_time() - t0) / 1000, (unsigned)out.size(),
-+             (unsigned)text.size());
-+    if (out.empty()) return false;
-+    out.back().last = last;
++             (t_http - t0) / 1000, (esp_timer_get_time() - t0) / 1000,
++             (unsigned)chunk.frames.size(), (unsigned)text.size());
++    if (chunk.frames.empty()) return false;
++    chunk.last = last;
 +
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (!IsCurrent(turn)) return true;
-+    for (auto& p : out) packets_.push_back(std::move(p));
++    chunks_.push_back(std::move(chunk));
 +    cv_.notify_all();
 +    return true;
 +}
@@ -977,49 +997,55 @@ index 0000000..4d088cd
 +void DirectProtocol::PlayerLoop() {
 +    auto& app = Application::GetInstance();
 +    uint32_t playing_turn = 0;
-+    int64_t play_start_us = 0;  // 이번 턴에서 첫 패킷을 넣은 시각
-+    int64_t queued_us = 0;      // 이번 턴에서 넣은 오디오 총 길이
++    int64_t play_start_us = 0;  // 재생 기준 시각
++    int64_t queued_us = 0;      // 기준 시각 이후 넣은 오디오 길이
 +
 +    while (true) {
-+        Packet p;
++        Chunk c;
 +        {
 +            std::unique_lock<std::mutex> lock(mutex_);
-+            cv_.wait(lock, [this]() { return stop_ || !packets_.empty(); });
++            cv_.wait(lock, [this]() { return stop_ || !chunks_.empty(); });
 +            if (stop_) return;
-+            p = std::move(packets_.front());
-+            packets_.pop_front();
++            c = std::move(chunks_.front());
++            chunks_.pop_front();
 +        }
-+        if (!IsCurrent(p.turn)) continue;
++        if (!IsCurrent(c.turn)) continue;
 +
-+        if (p.turn != playing_turn) {
++        if (c.turn != playing_turn) {
 +            // 새 턴 시작: 말하기 상태로 바꾸고, 상태가 바뀔 때까지 잠깐 기다린다
-+            playing_turn = p.turn;
-+            queued_us = 0;
++            playing_turn = c.turn;
 +            EmitJson("tts", "state", "start");
 +            for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking; i++) {
 +                vTaskDelay(pdMS_TO_TICKS(10));
 +            }
 +            play_start_us = esp_timer_get_time();
++            queued_us = 0;
 +        }
 +
-+        if (!p.payload.empty()) {
++        for (auto& f : c.frames) {
++            if (!IsCurrent(c.turn)) break;
++            int64_t elapsed = esp_timer_get_time() - play_start_us;
++            if (queued_us < elapsed) {
++                // 앞 문장과 사이가 떠서 재생이 비었으면 기준을 다시 잡는다 (몰아 넣다가 큐가 넘치지 않게)
++                play_start_us = esp_timer_get_time() - queued_us;
++            }
 +            // 재생 큐가 넘치지 않게 실제 재생 속도에 맞춰 넣는다
-+            while (IsCurrent(p.turn) &&
++            while (IsCurrent(c.turn) &&
 +                   queued_us - (esp_timer_get_time() - play_start_us) > kPlaybackLeadUs) {
 +                vTaskDelay(pdMS_TO_TICKS(10));
 +            }
-+            if (!IsCurrent(p.turn)) continue;
++            if (!IsCurrent(c.turn)) break;
 +            if (on_incoming_audio_) {
 +                auto pkt = std::make_unique<AudioStreamPacket>();
-+                pkt->sample_rate = p.sample_rate;
-+                pkt->frame_duration = p.frame_duration;
-+                pkt->payload = std::move(p.payload);
++                pkt->sample_rate = c.sample_rate;
++                pkt->frame_duration = f.duration_ms;
++                pkt->payload.assign(c.data.begin() + f.offset, c.data.begin() + f.offset + f.size);
 +                on_incoming_audio_(std::move(pkt));
 +            }
-+            queued_us += (int64_t)p.frame_duration * 1000;
++            queued_us += (int64_t)f.duration_ms * 1000;
 +        }
 +
-+        if (p.last && IsCurrent(p.turn)) {
++        if (c.last && IsCurrent(c.turn)) {
 +            // 앞서 넣은 음성이 다 재생될 때쯤 말하기를 끝낸다 (듣기 전환은 재생 큐가 빈 뒤에 일어남)
 +            EmitJson("tts", "state", "stop");
 +        }
@@ -1027,10 +1053,10 @@ index 0000000..4d088cd
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..3644d70
+index 0000000..10624d8
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,125 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1085,12 +1111,19 @@ index 0000000..3644d70
 +        std::string text;
 +        bool last;
 +    };
-+    struct Packet {
-+        uint32_t turn;
-+        int sample_rate;
-+        int frame_duration;
-+        std::vector<uint8_t> payload;
-+        bool last;
++    // 한 문장 분량의 음성. 프레임 수백 개를 따로 할당하면 내부 RAM이 바닥나므로
++    // 큰 버퍼 하나(PSRAM으로 감)에 이어 붙이고 위치만 따로 둔다.
++    struct Frame {
++        uint32_t offset;
++        uint16_t size;
++        uint16_t duration_ms;
++    };
++    struct Chunk {
++        uint32_t turn = 0;
++        int sample_rate = 0;
++        std::vector<uint8_t> data;
++        std::vector<Frame> frames;
++        bool last = false;
 +    };
 +
 +    DirectConfig config_;
@@ -1121,7 +1154,7 @@ index 0000000..3644d70
 +    std::condition_variable cv_;
 +    std::deque<std::pair<uint32_t, std::string>> llm_jobs_;  // turn 0 = 연결 예열
 +    std::deque<Sentence> tts_jobs_;
-+    std::deque<Packet> packets_;
++    std::deque<Chunk> chunks_;
 +    bool stop_ = false;
 +    std::thread llm_thread_, tts_thread_, player_thread_;
 +
