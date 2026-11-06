@@ -39,7 +39,7 @@ index 8966dec..f152787 100644
      string "Default OTA URL"
      default "https://api.tenclass.net/xiaozhi/ota/"
 diff --git a/main/application.cc b/main/application.cc
-index c814b54..f427757 100644
+index c814b54..8b5ff5b 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -12,6 +12,11 @@
@@ -73,33 +73,39 @@ index c814b54..f427757 100644
      // Create OTA object for activation process
      ota_ = std::make_unique<Ota>();
  
-+#if CONFIG_DIRECT_CLOUD_MODE
-+    // direct-cloud: OTA 서버가 없으므로 버전·에셋 확인을 건너뛴다
-+    ota_->MarkCurrentVersionValid();
-+#else
-     // Check for new assets version
+-    // Check for new assets version
++    // Check for new assets version (표정·웨이크워드 에셋 적용도 여기서 한다)
      CheckAssetsVersion();
  
++#if CONFIG_DIRECT_CLOUD_MODE
++    // direct-cloud: OTA 서버가 없으므로 펌웨어 버전 확인만 건너뛴다
++    ota_->MarkCurrentVersionValid();
++#else
      // Check for new firmware version
      CheckNewVersion();
 +#endif
  
      // Initialize the protocol
      InitializeProtocol();
-@@ -562,7 +580,12 @@ void Application::InitializeProtocol() {
+@@ -562,6 +580,9 @@ void Application::InitializeProtocol() {
  
      display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
  
 +#if CONFIG_DIRECT_CLOUD_MODE
 +    protocol_ = std::make_unique<DirectProtocol>();
-+    if (false) {
 +#else
      if (ota_->HasMqttConfig()) {
-+#endif
          protocol_ = std::make_unique<MqttProtocol>();
      } else if (ota_->HasWebsocketConfig()) {
-         protocol_ = std::make_unique<WebsocketProtocol>();
-@@ -752,7 +775,15 @@ void Application::InitializeProtocol() {
+@@ -570,6 +591,7 @@ void Application::InitializeProtocol() {
+         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+         protocol_ = std::make_unique<MqttProtocol>();
+     }
++#endif
+ 
+     protocol_->OnConnected([this]() { DismissAlert(); });
+ 
+@@ -752,7 +774,15 @@ void Application::InitializeProtocol() {
          }
      });
  
