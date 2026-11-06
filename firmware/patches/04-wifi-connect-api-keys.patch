@@ -1,11 +1,11 @@
 diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b/assets/wifi_configuration.html
 --- a/assets/wifi_configuration.html	2026-11-06 01:04:26.391156182 +0000
-+++ b/assets/wifi_configuration.html	2026-11-06 10:45:30.908755872 +0000
-@@ -559,6 +559,20 @@
-                     </div>
-                 </div>
- 
-+                <!-- direct-cloud: API keys -->
++++ b/assets/wifi_configuration.html	2026-11-06 15:04:32.749431441 +0000
+@@ -534,9 +534,26 @@
+                     <label for="password" data-lang="password">Password:</label>
+                     <input type="password" id="password" name="password">
+                 </p>
++                <!-- direct-cloud: API keys (Wi-Fi 연결과 함께 저장) -->
 +                <div id="direct_keys">
 +                    <label for="deepgram_key">Deepgram API 키 <span id="deepgram_state" class="key-state"></span></label>
 +                    <input type="password" id="deepgram_key" name="deepgram_key" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -19,32 +19,69 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    <p style="font-size: 12px; opacity: 0.7;">예: ko-KR-Wavenet-A, ko-KR-Wavenet-B, ko-KR-Neural2-A. 끝 글자를 바꾸면 목소리가 바뀝니다. 비워 두면 ko-KR-Wavenet-A.</p>
 +                </div>
 +
-                 <!-- Max TX Power -->
-                 <p class="field-inline">
-                     <label for="max_tx_power" data-lang="max_tx_power" style="white-space: nowrap;">Wi-Fi Max TX Power:</label>
-@@ -1665,7 +1679,11 @@
-                 ota_url: document.getElementById('ota_url').value,
-                 max_tx_power: parseInt(document.getElementById('max_tx_power').value),
-                 remember_bssid: document.getElementById('remember_bssid').checked,
--                sleep_mode: document.getElementById('sleep_mode').checked
-+                sleep_mode: document.getElementById('sleep_mode').checked,
-+                deepgram_key: document.getElementById('deepgram_key').value,
-+                deepseek_key: document.getElementById('deepseek_key').value,
-+                gtts_key: document.getElementById('gtts_key').value,
-+                tts_voice: document.getElementById('tts_voice').value
+                 <p>
+                     <input type="submit" value="Connect" id="button" data-lang-value="connect">
+                 </p>
++                <p>
++                    <button type="button" id="keys_only_button" onclick="saveKeysOnly()" style="width: 100%;">API 키만 저장</button>
++                </p>
+             </form>
+             <div id="ap_list"></div>
+         </div>
+@@ -1606,6 +1623,30 @@
+         /**
+          * Submit Wi-Fi connection form
+          */
++        // direct-cloud: Wi-Fi는 그대로 두고 키만 저장
++        async function saveKeysOnly() {
++            const keys = {};
++            for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'tts_voice']) {
++                const v = document.getElementById(k).value.trim();
++                if (v) keys[k] = v;
++            }
++            if (Object.keys(keys).length === 0) { showToast('입력된 키가 없어요'); return; }
++            try {
++                const r = await fetch('/advanced/submit', {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify(keys)
++                });
++                const d = await r.json();
++                if (!d.success) throw new Error();
++                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key']) document.getElementById(k).value = '';
++                loadAdvancedConfig();
++                showToast('API 키를 저장했어요');
++            } catch (e) {
++                showToast('API 키 저장 실패');
++            }
++        }
++
+         async function submitForm(event) {
+             event.preventDefault();
+             button.disabled = true;
+@@ -1621,6 +1662,21 @@
              };
  
              try {
-@@ -1684,6 +1702,8 @@
- 
-                 advancedButton.disabled = false;
-                 showToast('Configuration saved');
-+                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key']) document.getElementById(k).value = '';
-+                loadAdvancedConfig();
-             } catch (err) {
-                 advancedError.textContent = err.message;
-                 advancedButton.disabled = false;
-@@ -1749,6 +1769,11 @@
++                // direct-cloud: API 키를 먼저 저장하고 Wi-Fi에 연결한다
++                const keys = {};
++                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'tts_voice']) {
++                    const v = document.getElementById(k).value.trim();
++                    if (v) keys[k] = v;
++                }
++                if (Object.keys(keys).length > 0) {
++                    const kr = await fetch('/advanced/submit', {
++                        method: 'POST',
++                        headers: { 'Content-Type': 'application/json' },
++                        body: JSON.stringify(keys)
++                    });
++                    const kd = await kr.json();
++                    if (!kd.success) throw new Error('API 키 저장 실패');
++                }
+                 const response = await fetch('/submit', {
+                     method: 'POST',
+                     headers: {
+@@ -1749,6 +1805,11 @@
                  if (data.sleep_mode !== undefined) {
                      document.getElementById('sleep_mode').checked = data.sleep_mode;
                  }
