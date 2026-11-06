@@ -1,0 +1,116 @@
+diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b/assets/wifi_configuration.html
+--- a/assets/wifi_configuration.html	2026-11-06 01:04:26.391156182 +0000
++++ b/assets/wifi_configuration.html	2026-11-06 07:54:58.239121579 +0000
+@@ -559,6 +559,17 @@
+                     </div>
+                 </div>
+ 
++                <!-- direct-cloud: API keys -->
++                <div id="direct_keys">
++                    <label for="deepgram_key">Deepgram API 키 <span id="deepgram_state" class="key-state"></span></label>
++                    <input type="password" id="deepgram_key" name="deepgram_key" autocomplete="off" autocapitalize="off" spellcheck="false">
++                    <label for="deepseek_key">DeepSeek API 키 <span id="deepseek_state" class="key-state"></span></label>
++                    <input type="password" id="deepseek_key" name="deepseek_key" autocomplete="off" autocapitalize="off" spellcheck="false">
++                    <label for="gtts_key">Google TTS API 키 <span id="gtts_state" class="key-state"></span></label>
++                    <input type="password" id="gtts_key" name="gtts_key" autocomplete="off" autocapitalize="off" spellcheck="false">
++                    <p style="font-size: 12px; opacity: 0.7;">비워 두면 저장된 키를 그대로 씁니다.</p>
++                </div>
++
+                 <!-- Max TX Power -->
+                 <p class="field-inline">
+                     <label for="max_tx_power" data-lang="max_tx_power" style="white-space: nowrap;">Wi-Fi Max TX Power:</label>
+@@ -1665,7 +1676,10 @@
+                 ota_url: document.getElementById('ota_url').value,
+                 max_tx_power: parseInt(document.getElementById('max_tx_power').value),
+                 remember_bssid: document.getElementById('remember_bssid').checked,
+-                sleep_mode: document.getElementById('sleep_mode').checked
++                sleep_mode: document.getElementById('sleep_mode').checked,
++                deepgram_key: document.getElementById('deepgram_key').value,
++                deepseek_key: document.getElementById('deepseek_key').value,
++                gtts_key: document.getElementById('gtts_key').value
+             };
+ 
+             try {
+@@ -1684,6 +1698,8 @@
+ 
+                 advancedButton.disabled = false;
+                 showToast('Configuration saved');
++                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key']) document.getElementById(k).value = '';
++                loadAdvancedConfig();
+             } catch (err) {
+                 advancedError.textContent = err.message;
+                 advancedButton.disabled = false;
+@@ -1749,6 +1765,10 @@
+                 if (data.sleep_mode !== undefined) {
+                     document.getElementById('sleep_mode').checked = data.sleep_mode;
+                 }
++                for (const k of ['deepgram', 'deepseek', 'gtts']) {
++                    const el = document.getElementById(k + '_state');
++                    if (el) el.textContent = data[k + '_set'] ? '(저장됨)' : '(없음)';
++                }
+             } catch (error) {
+                 console.error('Error loading advanced config:', error);
+             }
+diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_configuration_ap.cc
+--- a/wifi_configuration_ap.cc	2026-11-06 01:04:26.388940730 +0000
++++ b/wifi_configuration_ap.cc	2026-11-06 07:54:58.237848445 +0000
+@@ -1,5 +1,7 @@
+ #include "wifi_configuration_ap.h"
+ #include <cstdio>
++#include <cctype>
++#include <string>
+ #include <memory>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
+@@ -533,6 +535,21 @@
+             cJSON_AddBoolToObject(json, "show_ota_config", this_->show_ota_config_);
+             cJSON_AddBoolToObject(json, "show_sleep_config", this_->show_sleep_config_);
+ 
++            // direct-cloud: 키 값은 돌려주지 않고 저장 여부만 알려준다
++            {
++                nvs_handle_t dnvs;
++                const char* keys[][2] = {{"deepgram_key", "deepgram_set"},
++                                         {"deepseek_key", "deepseek_set"},
++                                         {"gtts_key", "gtts_set"}};
++                bool opened = nvs_open("direct", NVS_READONLY, &dnvs) == ESP_OK;
++                for (auto& k : keys) {
++                    size_t len = 0;
++                    bool set = opened && nvs_get_str(dnvs, k[0], nullptr, &len) == ESP_OK && len > 1;
++                    cJSON_AddBoolToObject(json, k[1], set);
++                }
++                if (opened) nvs_close(dnvs);
++            }
++
+             // 发送JSON响应
+             char *json_str = cJSON_PrintUnformatted(json);
+             cJSON_Delete(json);
+@@ -601,6 +618,29 @@
+                 return ESP_FAIL;
+             }
+ 
++            // direct-cloud: API 키 저장 (빈 칸이면 기존 값 유지)
++            {
++                const char* fields[][2] = {{"deepgram_key", "deepgram_key"},
++                                           {"deepseek_key", "deepseek_key"},
++                                           {"gtts_key", "gtts_key"}};
++                nvs_handle_t dnvs;
++                if (nvs_open("direct", NVS_READWRITE, &dnvs) == ESP_OK) {
++                    for (auto& f : fields) {
++                        cJSON* v = cJSON_GetObjectItem(json, f[0]);
++                        if (cJSON_IsString(v) && v->valuestring && v->valuestring[0]) {
++                            std::string val = v->valuestring;
++                            while (!val.empty() && isspace((unsigned char)val.back())) val.pop_back();
++                            while (!val.empty() && isspace((unsigned char)val.front())) val.erase(0, 1);
++                            if (!val.empty() && nvs_set_str(dnvs, f[1], val.c_str()) != ESP_OK) {
++                                ESP_LOGE(TAG, "Failed to save %s", f[1]);
++                            }
++                        }
++                    }
++                    nvs_commit(dnvs);
++                    nvs_close(dnvs);
++                }
++            }
++
+             // 保存OTA URL
+             cJSON *ota_url = cJSON_GetObjectItem(json, "ota_url");
+             if (cJSON_IsString(ota_url) && ota_url->valuestring) {

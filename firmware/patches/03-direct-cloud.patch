@@ -1,0 +1,965 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 8c318f1..aaa7d9d 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -33,6 +33,7 @@ set(SOURCES "audio/audio_codec.cc"
+             "protocols/text_glyph_payload.cc"
+             "protocols/mqtt_protocol.cc"
+             "protocols/websocket_protocol.cc"
++            "protocols/direct_protocol.cc"
+             "mcp_server.cc"
+             "system_info.cc"
+             "application.cc"
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index 8966dec..6ff0e31 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -1,5 +1,23 @@
+ menu "Xiaozhi Assistant"
+ 
++config DIRECT_CLOUD_MODE
++    bool "Direct cloud mode (no xiaozhi server)"
++    default n
++    help
++        Call Deepgram (ASR), DeepSeek (LLM) and Google Cloud TTS directly from the device.
++        API keys are entered in the Wi-Fi configuration page (Advanced tab) and kept in NVS.
++        Only for Wi-Fi boards.
++
++config DIRECT_LLM_MODEL
++    string "DeepSeek model name"
++    default "deepseek-flash"
++    depends on DIRECT_CLOUD_MODE
++
++config DIRECT_TTS_VOICE
++    string "Google TTS voice name"
++    default "ko-KR-Neural2-A"
++    depends on DIRECT_CLOUD_MODE
++
+ config OTA_URL
+     string "Default OTA URL"
+     default "https://api.tenclass.net/xiaozhi/ota/"
+diff --git a/main/application.cc b/main/application.cc
+index c814b54..5955a56 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -12,6 +12,10 @@
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
+ #include "latency_probe.h"
++#if CONFIG_DIRECT_CLOUD_MODE
++#include "direct_protocol.h"
++#include "wifi_board.h"
++#endif
+ 
+ #include <driver/gpio.h>
+ #include <esp_log.h>
+@@ -386,11 +390,16 @@ void Application::ActivationTask() {
+     // Create OTA object for activation process
+     ota_ = std::make_unique<Ota>();
+ 
++#if CONFIG_DIRECT_CLOUD_MODE
++    // direct-cloud: OTA 서버가 없으므로 버전·에셋 확인을 건너뛴다
++    ota_->MarkCurrentVersionValid();
++#else
+     // Check for new assets version
+     CheckAssetsVersion();
+ 
+     // Check for new firmware version
+     CheckNewVersion();
++#endif
+ 
+     // Initialize the protocol
+     InitializeProtocol();
+@@ -562,7 +571,12 @@ void Application::InitializeProtocol() {
+ 
+     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+ 
++#if CONFIG_DIRECT_CLOUD_MODE
++    protocol_ = std::make_unique<DirectProtocol>();
++    if (false) {
++#else
+     if (ota_->HasMqttConfig()) {
++#endif
+         protocol_ = std::make_unique<MqttProtocol>();
+     } else if (ota_->HasWebsocketConfig()) {
+         protocol_ = std::make_unique<WebsocketProtocol>();
+@@ -752,7 +766,17 @@ void Application::InitializeProtocol() {
+         }
+     });
+ 
++#if CONFIG_DIRECT_CLOUD_MODE
++    if (!protocol_->Start()) {
++        // API 키가 없으면 설정 화면(192.168.4.1)으로 들어가서 입력받는다
++        ESP_LOGW(TAG, "Direct mode keys missing, entering Wi-Fi config mode");
++        Schedule([]() {
++            static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode();
++        });
++    }
++#else
+     protocol_->Start();
++#endif
+ }
+ 
+ void Application::ShowActivationCode(const std::string& code, const std::string& message) {
+diff --git a/main/idf_component.yml b/main/idf_component.yml
+index c9c64ec..aaf7dd4 100644
+--- a/main/idf_component.yml
++++ b/main/idf_component.yml
+@@ -24,7 +24,10 @@ dependencies:
+   waveshare/custom_io_expander_ch32v003: ^2.0.0
+   espressif/esp_lcd_panel_io_additions: ^1.0.1~1
+   78/esp_lcd_nv3023: ==1.0.1
+-  78/esp-wifi-connect: ~3.3.1
++  78/esp-wifi-connect:
++    version: ~3.3.1
++    # direct-cloud: 고급 탭에 API 키 입력 칸을 추가한 사본
++    override_path: ../components/esp-wifi-connect
+   # Stay below the P4 rev>=3.0 CMake gate until rev-1.x boards are retired.
+   espressif/esp_audio_effects: ~1.3.0
+   espressif/esp_audio_codec: ~2.5.0
+diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
+new file mode 100644
+index 0000000..e016a42
+--- /dev/null
++++ b/main/protocols/direct_protocol.cc
+@@ -0,0 +1,727 @@
++// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
++//
++// 흐름
++//   듣기:   마이크 Opus → PCM16 → Deepgram 실시간 WebSocket (말 끝 판정도 Deepgram)
++//   답변:   DeepSeek chat/completions 스트리밍(SSE) → 문장 단위로 자름
++//   음성:   문장마다 Google TTS(OGG_OPUS) → Ogg 분해 → 기존 재생 경로로 전달
++// Application에는 기존 서버와 같은 JSON(stt / tts / llm)을 흉내 내서 넘기므로
++// 상태 전환·표정·재생 로직은 그대로 쓴다.
++
++#include "direct_protocol.h"
++
++#include "application.h"
++#include "audio_service.h"
++#include "board.h"
++#include "settings.h"
++
++#include <cJSON.h>
++#include <esp_log.h>
++#include <esp_opus_dec.h>
++#include <esp_pthread.h>
++#include <esp_timer.h>
++
++#include <algorithm>
++#include <cstring>
++
++#define TAG "DirectProtocol"
++
++namespace {
++
++constexpr int kUpSampleRate = 16000;            // 마이크 → Deepgram
++constexpr int kTtsSampleRate = 24000;           // Google TTS 출력
++constexpr int64_t kPlaybackLeadUs = 200 * 1000; // 재생 큐에 미리 넣어 둘 오디오 길이
++constexpr size_t kHistoryTurns = 6;             // 기억할 대화 턴 수
++
++const char* kDeepgramUrl =
++    "wss://api.deepgram.com/v1/listen?model=nova-3&language=ko&encoding=linear16"
++    "&sample_rate=16000&channels=1&interim_results=true&endpointing=300"
++    "&utterance_end_ms=1000&smart_format=true&punctuate=true";
++const char* kDeepseekUrl = "https://api.deepseek.com/chat/completions";
++const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
++
++const char* kSystemPrompt =
++    "너는 책상 위에 사는 작은 로봇 스택짱이야.\n"
++    "항상 한국어로, 두세 문장 이내로 짧게 대답해.\n"
++    "말투는 친근하지만 반말과 존댓말을 섞지 말고 존댓말로 통일해.\n"
++    "이모지, 마크다운, 목록 기호는 쓰지 마. 소리로 읽히는 대답이기 때문이야.\n"
++    "모르는 건 모른다고 말해.\n"
++    "대답 맨 앞에는 반드시 지금 감정을 대괄호 태그 하나로 붙여. 예: [happy] 안녕하세요.\n"
++    "쓸 수 있는 감정: happy, laughing, funny, loving, embarrassed, confident, delicious, "
++    "sad, crying, sleepy, silly, angry, surprised, shocked, thinking, winking, relaxed, "
++    "confused, neutral";
++
++const char* kEmotions[] = {"happy",    "laughing", "funny",   "loving",    "embarrassed",
++                           "confident", "delicious", "sad",    "crying",    "sleepy",
++                           "silly",    "angry",    "surprised", "shocked",  "thinking",
++                           "winking",  "relaxed",  "confused", "neutral"};
++
++bool IsKnownEmotion(const std::string& e) {
++    for (auto* k : kEmotions) {
++        if (e == k) return true;
++    }
++    return false;
++}
++
++// 작은 base64 디코더 (Google TTS audioContent용)
++std::vector<uint8_t> Base64Decode(const char* in, size_t len) {
++    static int8_t table[256];
++    static bool init = false;
++    if (!init) {
++        memset(table, -1, sizeof(table));
++        const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++        for (int i = 0; i < 64; i++) table[(uint8_t)chars[i]] = i;
++        init = true;
++    }
++    std::vector<uint8_t> out;
++    out.reserve(len * 3 / 4);
++    uint32_t acc = 0;
++    int bits = 0;
++    for (size_t i = 0; i < len; i++) {
++        int8_t v = table[(uint8_t)in[i]];
++        if (v < 0) continue;  // '=' 및 공백 무시
++        acc = (acc << 6) | v;
++        bits += 6;
++        if (bits >= 8) {
++            bits -= 8;
++            out.push_back((acc >> bits) & 0xFF);
++        }
++    }
++    return out;
++}
++
++// 문장 끝으로 볼 위치를 찾는다. 첫 문장은 쉼표에서도 끊어서 첫 소리를 빨리 낸다.
++size_t FindSentenceEnd(const std::string& s, bool first) {
++    for (size_t i = 0; i < s.size(); i++) {
++        char c = s[i];
++        if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '~') {
++            // 소수점(3.5) 같은 경우는 넘긴다
++            if (c == '.' && i + 1 < s.size() && isdigit((unsigned char)s[i + 1])) continue;
++            return i + 1;
++        }
++        if (first && c == ',' && i >= 24) return i + 1;
++    }
++    return std::string::npos;
++}
++
++std::string Trim(const std::string& s) {
++    size_t b = s.find_first_not_of(" \t\r\n");
++    if (b == std::string::npos) return "";
++    size_t e = s.find_last_not_of(" \t\r\n");
++    return s.substr(b, e - b + 1);
++}
++
++// 소리로 읽을 때 방해되는 기호 제거
++std::string CleanForSpeech(const std::string& s) {
++    std::string out;
++    out.reserve(s.size());
++    for (char c : s) {
++        if (c == '*' || c == '#' || c == '`' || c == '_' || c == '>') continue;
++        out.push_back(c);
++    }
++    return Trim(out);
++}
++
++}  // namespace
++
++DirectConfig DirectConfig::Load() {
++    Settings s("direct", false);
++    DirectConfig c;
++    c.deepgram_key = s.GetString("deepgram_key");
++    c.deepseek_key = s.GetString("deepseek_key");
++    c.google_tts_key = s.GetString("gtts_key");
++    c.llm_model = s.GetString("llm_model", CONFIG_DIRECT_LLM_MODEL);
++    c.tts_voice = s.GetString("tts_voice", CONFIG_DIRECT_TTS_VOICE);
++    return c;
++}
++
++DirectProtocol::DirectProtocol() {
++    server_sample_rate_ = kTtsSampleRate;
++    server_frame_duration_ = 20;
++}
++
++DirectProtocol::~DirectProtocol() {
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        stop_ = true;
++    }
++    cv_.notify_all();
++    if (llm_thread_.joinable()) llm_thread_.join();
++    if (tts_thread_.joinable()) tts_thread_.join();
++    if (player_thread_.joinable()) player_thread_.join();
++    if (keepalive_timer_) {
++        esp_timer_stop(keepalive_timer_);
++        esp_timer_delete(keepalive_timer_);
++    }
++    if (opus_decoder_) esp_opus_dec_close(opus_decoder_);
++}
++
++bool DirectProtocol::Start() {
++    config_ = DirectConfig::Load();
++    if (!config_.IsComplete()) {
++        ESP_LOGE(TAG, "API keys missing (deepgram=%d deepseek=%d gtts=%d)",
++                 !config_.deepgram_key.empty(), !config_.deepseek_key.empty(),
++                 !config_.google_tts_key.empty());
++        SetError("API 키가 설정되지 않았어요. Wi-Fi 설정 화면의 고급 탭에서 입력해 주세요.");
++        return false;
++    }
++    ESP_LOGI(TAG, "Direct mode: llm=%s voice=%s", config_.llm_model.c_str(),
++             config_.tts_voice.c_str());
++
++    auto cfg = esp_pthread_get_default_config();
++    cfg.stack_size = 10 * 1024;
++    cfg.prio = 4;
++    cfg.thread_name = "direct_llm";
++    esp_pthread_set_cfg(&cfg);
++    llm_thread_ = std::thread([this]() { LlmLoop(); });
++    cfg.thread_name = "direct_tts";
++    esp_pthread_set_cfg(&cfg);
++    tts_thread_ = std::thread([this]() { TtsLoop(); });
++    cfg.stack_size = 4 * 1024;
++    cfg.prio = 6;
++    cfg.thread_name = "direct_play";
++    esp_pthread_set_cfg(&cfg);
++    player_thread_ = std::thread([this]() { PlayerLoop(); });
++    auto def = esp_pthread_get_default_config();
++    esp_pthread_set_cfg(&def);
++
++    // Deepgram은 10초 동안 아무것도 안 오면 연결을 닫으므로 KeepAlive를 보낸다
++    esp_timer_create_args_t targs = {
++        .callback =
++            [](void* arg) {
++                auto self = static_cast<DirectProtocol*>(arg);
++                if (self->asr_ws_ && self->asr_ws_->IsConnected() &&
++                    esp_timer_get_time() - self->last_audio_sent_us_ > 3 * 1000 * 1000) {
++                    self->asr_ws_->Send(std::string("{\"type\":\"KeepAlive\"}"));
++                }
++            },
++        .arg = this,
++        .dispatch_method = ESP_TIMER_TASK,
++        .name = "dg_keepalive",
++        .skip_unhandled_events = true,
++    };
++    esp_timer_create(&targs, &keepalive_timer_);
++    esp_timer_start_periodic(keepalive_timer_, 4 * 1000 * 1000);
++
++    if (on_connected_) on_connected_();
++    return true;
++}
++
++bool DirectProtocol::EnsureOpusDecoder() {
++    if (opus_decoder_) return true;
++    esp_opus_dec_cfg_t cfg = {
++        .sample_rate = (uint32_t)kUpSampleRate,
++        .channel = ESP_AUDIO_MONO,
++        .frame_duration = (esp_opus_dec_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(OPUS_FRAME_DURATION_MS),
++        .self_delimited = false,
++    };
++    esp_opus_dec_open(&cfg, sizeof(cfg), &opus_decoder_);
++    if (!opus_decoder_) {
++        ESP_LOGE(TAG, "Failed to open opus decoder");
++        return false;
++    }
++    pcm_buf_.resize(kUpSampleRate / 1000 * OPUS_FRAME_DURATION_MS);
++    return true;
++}
++
++bool DirectProtocol::OpenAudioChannel() {
++    if (!config_.IsComplete()) {
++        SetError("API 키가 설정되지 않았어요.");
++        return false;
++    }
++    error_occurred_ = false;
++    auto network = Board::GetInstance().GetNetwork();
++    asr_ws_ = network->CreateWebSocket(1);
++    if (!asr_ws_) {
++        SetError("음성 인식 연결을 만들지 못했어요.");
++        return false;
++    }
++    std::string auth = "Token " + config_.deepgram_key;
++    asr_ws_->SetHeader("Authorization", auth.c_str());
++    asr_ws_->OnData([this](const char* data, size_t len, bool binary) {
++        if (!binary) OnAsrMessage(data, len);
++    });
++    asr_ws_->OnDisconnected([this]() {
++        ESP_LOGI(TAG, "Deepgram disconnected");
++        listening_ = false;
++        if (on_audio_channel_closed_) on_audio_channel_closed_();
++    });
++
++    int64_t t0 = esp_timer_get_time();
++    auto result = asr_ws_->Connect(kDeepgramUrl);
++    if (!result) {
++        ESP_LOGE(TAG, "Deepgram connect failed");
++        asr_ws_.reset();
++        SetError("음성 인식 서버에 연결하지 못했어요. 키와 네트워크를 확인해 주세요.");
++        return false;
++    }
++    ESP_LOGI(TAG, "Deepgram connected in %lld ms", (esp_timer_get_time() - t0) / 1000);
++    last_audio_sent_us_ = esp_timer_get_time();
++    if (on_audio_channel_opened_) on_audio_channel_opened_();
++    return true;
++}
++
++void DirectProtocol::CloseAudioChannel(bool send_goodbye) {
++    listening_ = false;
++    if (asr_ws_) {
++        if (asr_ws_->IsConnected()) {
++            asr_ws_->Send(std::string("{\"type\":\"CloseStream\"}"));
++        }
++        asr_ws_.reset();
++    }
++}
++
++bool DirectProtocol::IsAudioChannelOpened() const {
++    return asr_ws_ != nullptr && asr_ws_->IsConnected() && !error_occurred_;
++}
++
++bool DirectProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
++    if (!listening_ || !asr_ws_ || !asr_ws_->IsConnected()) return true;
++    if (!EnsureOpusDecoder()) return false;
++
++    esp_audio_dec_in_raw_t raw = {
++        .buffer = packet->payload.data(),
++        .len = (uint32_t)packet->payload.size(),
++        .consumed = 0,
++        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
++    };
++    esp_audio_dec_out_frame_t out = {
++        .buffer = (uint8_t*)pcm_buf_.data(),
++        .len = (uint32_t)(pcm_buf_.size() * sizeof(int16_t)),
++        .decoded_size = 0,
++    };
++    esp_audio_dec_info_t info = {};
++    if (esp_opus_dec_decode(opus_decoder_, &raw, &out, &info) != ESP_AUDIO_ERR_OK) {
++        return true;
++    }
++    last_audio_sent_us_ = esp_timer_get_time();
++    return asr_ws_->Send(pcm_buf_.data(), out.decoded_size, true);
++}
++
++void DirectProtocol::SendStartListening(ListeningMode mode) {
++    std::lock_guard<std::mutex> lock(asr_mutex_);
++    utterance_.clear();
++    listening_ = true;
++}
++
++void DirectProtocol::SendStopListening() {
++    // 수동 모드에서 버튼을 놓은 경우: 지금까지 인식된 걸로 마무리
++    if (!listening_) return;
++    if (asr_ws_ && asr_ws_->IsConnected()) {
++        asr_ws_->Send(std::string("{\"type\":\"Finalize\"}"));
++    }
++}
++
++void DirectProtocol::SendWakeWordDetected(const std::string& wake_word) {
++    // 서버 모드에서는 서버가 인사말을 보내지만, 직접 모드에서는 바로 듣기로 들어간다.
++}
++
++void DirectProtocol::SendAbortSpeaking(AbortReason reason) {
++    // 진행 중인 답변·합성·재생을 모두 버린다
++    turn_.fetch_add(1);
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        llm_jobs_.clear();
++        tts_jobs_.clear();
++        packets_.clear();
++    }
++    cv_.notify_all();
++}
++
++void DirectProtocol::SendMcpMessage(const std::string& message) {}
++
++bool DirectProtocol::SendText(const std::string& text) { return true; }
++
++void DirectProtocol::EmitJson(const char* type, const char* key1, const char* val1,
++                              const char* key2, const char* val2) {
++    if (!on_incoming_json_) return;
++    cJSON* root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "type", type);
++    if (key1) cJSON_AddStringToObject(root, key1, val1);
++    if (key2) cJSON_AddStringToObject(root, key2, val2);
++    on_incoming_json_(root);
++    cJSON_Delete(root);
++}
++
++void DirectProtocol::OnAsrMessage(const char* data, size_t len) {
++    last_incoming_time_ = std::chrono::steady_clock::now();
++    cJSON* root = cJSON_ParseWithLength(data, len);
++    if (!root) return;
++    auto type = cJSON_GetObjectItem(root, "type");
++    if (cJSON_IsString(type)) {
++        if (strcmp(type->valuestring, "Results") == 0) {
++            bool is_final = cJSON_IsTrue(cJSON_GetObjectItem(root, "is_final"));
++            bool speech_final = cJSON_IsTrue(cJSON_GetObjectItem(root, "speech_final"));
++            bool from_finalize = cJSON_IsTrue(cJSON_GetObjectItem(root, "from_finalize"));
++            const char* transcript = nullptr;
++            auto channel = cJSON_GetObjectItem(root, "channel");
++            auto alts = channel ? cJSON_GetObjectItem(channel, "alternatives") : nullptr;
++            auto alt0 = alts ? cJSON_GetArrayItem(alts, 0) : nullptr;
++            auto t = alt0 ? cJSON_GetObjectItem(alt0, "transcript") : nullptr;
++            if (cJSON_IsString(t)) transcript = t->valuestring;
++
++            if (is_final && transcript && transcript[0] && listening_) {
++                std::lock_guard<std::mutex> lock(asr_mutex_);
++                if (!utterance_.empty()) utterance_ += " ";
++                utterance_ += transcript;
++            }
++            if (speech_final || from_finalize) FinishUtterance();
++        } else if (strcmp(type->valuestring, "UtteranceEnd") == 0) {
++            FinishUtterance();
++        } else if (strcmp(type->valuestring, "Error") == 0 ||
++                   strcmp(type->valuestring, "error") == 0) {
++            char* s = cJSON_PrintUnformatted(root);
++            ESP_LOGE(TAG, "Deepgram error: %s", s ? s : "");
++            if (s) cJSON_free(s);
++        }
++    }
++    cJSON_Delete(root);
++}
++
++void DirectProtocol::FinishUtterance() {
++    std::string text;
++    {
++        std::lock_guard<std::mutex> lock(asr_mutex_);
++        if (!listening_ || utterance_.empty()) return;
++        text = Trim(utterance_);
++        utterance_.clear();
++        listening_ = false;
++    }
++    if (text.empty()) {
++        listening_ = true;
++        return;
++    }
++    EmitJson("stt", "text", text.c_str());
++
++    uint32_t turn = turn_.fetch_add(1) + 1;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        llm_jobs_.emplace_back(turn, text);
++    }
++    cv_.notify_all();
++}
++
++std::string DirectProtocol::BuildLlmBody(const std::string& user_text) {
++    cJSON* root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "model", config_.llm_model.c_str());
++    cJSON_AddBoolToObject(root, "stream", true);
++    cJSON_AddNumberToObject(root, "max_tokens", 300);
++    cJSON* msgs = cJSON_AddArrayToObject(root, "messages");
++    auto add = [msgs](const char* role, const std::string& content) {
++        cJSON* m = cJSON_CreateObject();
++        cJSON_AddStringToObject(m, "role", role);
++        cJSON_AddStringToObject(m, "content", content.c_str());
++        cJSON_AddItemToArray(msgs, m);
++    };
++    add("system", kSystemPrompt);
++    {
++        std::lock_guard<std::mutex> lock(history_mutex_);
++        for (auto& h : history_) {
++            add("user", h.first);
++            add("assistant", h.second);
++        }
++    }
++    add("user", user_text);
++    char* s = cJSON_PrintUnformatted(root);
++    std::string body = s ? s : "";
++    if (s) cJSON_free(s);
++    cJSON_Delete(root);
++    return body;
++}
++
++void DirectProtocol::LlmLoop() {
++    while (true) {
++        std::pair<uint32_t, std::string> job;
++        {
++            std::unique_lock<std::mutex> lock(mutex_);
++            cv_.wait(lock, [this]() { return stop_ || !llm_jobs_.empty(); });
++            if (stop_) return;
++            job = std::move(llm_jobs_.front());
++            llm_jobs_.pop_front();
++        }
++        if (IsCurrent(job.first)) RunLlm(job.first, job.second);
++    }
++}
++
++void DirectProtocol::RunLlm(uint32_t turn, const std::string& user_text) {
++    int64_t t0 = esp_timer_get_time();
++    auto network = Board::GetInstance().GetNetwork();
++    if (!llm_http_) {
++        llm_http_ = network->CreateHttp(2);
++        llm_http_->SetKeepAlive(true);
++    }
++    auto& http = llm_http_;
++    http->SetTimeout(15000);
++    http->SetHeader("Authorization", "Bearer " + config_.deepseek_key);
++    http->SetHeader("Content-Type", "application/json");
++    http->SetHeader("Accept", "text/event-stream");
++    http->SetContent(BuildLlmBody(user_text));
++
++    auto finish_with_error = [&](const char* msg) {
++        ESP_LOGE(TAG, "%s", msg);
++        http->Close();
++        if (IsCurrent(turn)) {
++            std::lock_guard<std::mutex> lock(mutex_);
++            tts_jobs_.push_back({turn, "죄송해요, 지금은 대답하기 어려워요.", true});
++            cv_.notify_all();
++        }
++    };
++
++    if (!http->Open("POST", kDeepseekUrl)) {
++        finish_with_error("DeepSeek open failed");
++        return;
++    }
++    auto status = http->GetStatusCode();
++    if (!status || *status != 200) {
++        std::string body = http->ReadAll();
++        ESP_LOGE(TAG, "DeepSeek status %d: %.200s", status ? *status : -1, body.c_str());
++        finish_with_error("DeepSeek request failed");
++        return;
++    }
++    ESP_LOGI(TAG, "LAT llm_headers=%lld ms", (esp_timer_get_time() - t0) / 1000);
++
++    std::string line_buf, text_buf, full_reply;
++    bool emotion_done = false, first_sentence = true, first_token = true;
++    char buf[512];
++    bool done = false;
++
++    auto push_sentence = [&](const std::string& raw, bool last) {
++        std::string s = CleanForSpeech(raw);
++        if (s.empty() && !last) return;
++        std::lock_guard<std::mutex> lock(mutex_);
++        tts_jobs_.push_back({turn, s, last});
++        cv_.notify_all();
++    };
++
++    while (!done) {
++        if (!IsCurrent(turn)) {  // 중간에 끊김
++            http->Close();
++            return;
++        }
++        auto r = http->Read(buf, sizeof(buf));
++        if (!r || *r <= 0) break;
++        line_buf.append(buf, *r);
++        size_t pos;
++        while ((pos = line_buf.find('\n')) != std::string::npos) {
++            std::string line = Trim(line_buf.substr(0, pos));
++            line_buf.erase(0, pos + 1);
++            if (line.rfind("data:", 0) != 0) continue;  // ": keep-alive" 등
++            std::string payload = Trim(line.substr(5));
++            if (payload == "[DONE]") {
++                done = true;
++                break;
++            }
++            cJSON* j = cJSON_Parse(payload.c_str());
++            if (!j) continue;
++            auto choices = cJSON_GetObjectItem(j, "choices");
++            auto c0 = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
++            auto delta = c0 ? cJSON_GetObjectItem(c0, "delta") : nullptr;
++            auto content = delta ? cJSON_GetObjectItem(delta, "content") : nullptr;
++            if (cJSON_IsString(content) && content->valuestring[0]) {
++                if (first_token) {
++                    first_token = false;
++                    ESP_LOGI(TAG, "LAT llm_first_token=%lld ms", (esp_timer_get_time() - t0) / 1000);
++                }
++                text_buf += content->valuestring;
++            }
++            cJSON_Delete(j);
++
++            // 맨 앞 감정 태그 처리
++            if (!emotion_done) {
++                std::string t = Trim(text_buf);
++                if (t.empty()) continue;
++                if (t[0] == '[') {
++                    size_t close = t.find(']');
++                    if (close == std::string::npos) {
++                        if (t.size() < 20) continue;  // 태그가 아직 덜 옴
++                        emotion_done = true;
++                    } else {
++                        std::string emo = t.substr(1, close - 1);
++                        if (IsKnownEmotion(emo)) EmitJson("llm", "emotion", emo.c_str());
++                        text_buf = t.substr(close + 1);
++                        emotion_done = true;
++                    }
++                } else {
++                    emotion_done = true;
++                }
++            }
++            // 문장 단위로 잘라서 TTS로
++            size_t end;
++            while ((end = FindSentenceEnd(text_buf, first_sentence)) != std::string::npos) {
++                std::string sentence = text_buf.substr(0, end);
++                text_buf.erase(0, end);
++                if (Trim(sentence).empty()) continue;
++                full_reply += sentence;
++                push_sentence(sentence, false);
++                first_sentence = false;
++            }
++        }
++    }
++    // [DONE] 이후 남은 본문을 읽어 연결을 재사용할 수 있는 상태로 만든다
++    if (done) {
++        while (true) {
++            auto r = http->Read(buf, sizeof(buf));
++            if (!r || *r <= 0) break;
++        }
++    } else {
++        http->Close();
++    }
++    full_reply += text_buf;
++    push_sentence(text_buf, true);
++    ESP_LOGI(TAG, "LAT llm_total=%lld ms", (esp_timer_get_time() - t0) / 1000);
++
++    std::string reply = Trim(full_reply);
++    if (!reply.empty() && IsCurrent(turn)) {
++        std::lock_guard<std::mutex> lock(history_mutex_);
++        history_.emplace_back(user_text, reply);
++        while (history_.size() > kHistoryTurns) history_.pop_front();
++    }
++}
++
++void DirectProtocol::TtsLoop() {
++    while (true) {
++        Sentence job;
++        {
++            std::unique_lock<std::mutex> lock(mutex_);
++            cv_.wait(lock, [this]() { return stop_ || !tts_jobs_.empty(); });
++            if (stop_) return;
++            job = std::move(tts_jobs_.front());
++            tts_jobs_.pop_front();
++        }
++        if (!IsCurrent(job.turn)) continue;
++        if (job.text.empty() || !Synthesize(job.turn, job.text, job.last)) {
++            if (job.last) {
++                // 마지막 표시만 넘겨서 재생 쪽이 턴을 끝낼 수 있게 한다
++                std::lock_guard<std::mutex> lock(mutex_);
++                packets_.push_back({job.turn, kTtsSampleRate, 20, {}, true});
++                cv_.notify_all();
++            }
++        }
++    }
++}
++
++bool DirectProtocol::Synthesize(uint32_t turn, const std::string& text, bool last) {
++    int64_t t0 = esp_timer_get_time();
++    auto network = Board::GetInstance().GetNetwork();
++    if (!tts_http_) {
++        tts_http_ = network->CreateHttp(3);
++        tts_http_->SetKeepAlive(true);
++    }
++    auto& http = tts_http_;
++
++    cJSON* root = cJSON_CreateObject();
++    cJSON* input = cJSON_AddObjectToObject(root, "input");
++    cJSON_AddStringToObject(input, "text", text.c_str());
++    cJSON* voice = cJSON_AddObjectToObject(root, "voice");
++    cJSON_AddStringToObject(voice, "languageCode", "ko-KR");
++    cJSON_AddStringToObject(voice, "name", config_.tts_voice.c_str());
++    cJSON* ac = cJSON_AddObjectToObject(root, "audioConfig");
++    cJSON_AddStringToObject(ac, "audioEncoding", "OGG_OPUS");
++    cJSON_AddNumberToObject(ac, "sampleRateHertz", kTtsSampleRate);
++    char* s = cJSON_PrintUnformatted(root);
++    std::string body = s ? s : "";
++    if (s) cJSON_free(s);
++    cJSON_Delete(root);
++
++    http->SetTimeout(10000);
++    http->SetHeader("Content-Type", "application/json");
++    http->SetHeader("X-Goog-Api-Key", config_.google_tts_key);
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", kTtsUrl)) {
++        ESP_LOGE(TAG, "TTS open failed");
++        http->Close();
++        return false;
++    }
++    auto status = http->GetStatusCode();
++    std::string resp = http->ReadAll();
++    if (!status || *status != 200) {
++        ESP_LOGE(TAG, "TTS status %d: %.200s", status ? *status : -1, resp.c_str());
++        http->Close();
++        return false;
++    }
++    int64_t t_http = esp_timer_get_time();
++
++    cJSON* j = cJSON_Parse(resp.c_str());
++    resp.clear();
++    resp.shrink_to_fit();
++    auto ac_item = j ? cJSON_GetObjectItem(j, "audioContent") : nullptr;
++    if (!cJSON_IsString(ac_item)) {
++        ESP_LOGE(TAG, "TTS response has no audioContent");
++        if (j) cJSON_Delete(j);
++        return false;
++    }
++    auto ogg = Base64Decode(ac_item->valuestring, strlen(ac_item->valuestring));
++    cJSON_Delete(j);
++    if (!IsCurrent(turn)) return true;
++
++    std::vector<Packet> out;
++    OggDemuxer demuxer;
++    demuxer.OnPacket([&](const uint8_t* data, int sample_rate, int frame_duration_ms, size_t size) {
++        out.push_back({turn, sample_rate, frame_duration_ms,
++                       std::vector<uint8_t>(data, data + size), false});
++    });
++    demuxer.Reset();
++    demuxer.Process(ogg.data(), ogg.size());
++    ESP_LOGI(TAG, "LAT tts http=%lld ms total=%lld ms packets=%u chars=%u",
++             (t_http - t0) / 1000, (esp_timer_get_time() - t0) / 1000, (unsigned)out.size(),
++             (unsigned)text.size());
++    if (out.empty()) return false;
++    out.back().last = last;
++
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!IsCurrent(turn)) return true;
++    for (auto& p : out) packets_.push_back(std::move(p));
++    cv_.notify_all();
++    return true;
++}
++
++void DirectProtocol::PlayerLoop() {
++    auto& app = Application::GetInstance();
++    uint32_t playing_turn = 0;
++    int64_t play_start_us = 0;  // 이번 턴에서 첫 패킷을 넣은 시각
++    int64_t queued_us = 0;      // 이번 턴에서 넣은 오디오 총 길이
++
++    while (true) {
++        Packet p;
++        {
++            std::unique_lock<std::mutex> lock(mutex_);
++            cv_.wait(lock, [this]() { return stop_ || !packets_.empty(); });
++            if (stop_) return;
++            p = std::move(packets_.front());
++            packets_.pop_front();
++        }
++        if (!IsCurrent(p.turn)) continue;
++
++        if (p.turn != playing_turn) {
++            // 새 턴 시작: 말하기 상태로 바꾸고, 상태가 바뀔 때까지 잠깐 기다린다
++            playing_turn = p.turn;
++            queued_us = 0;
++            EmitJson("tts", "state", "start");
++            for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking; i++) {
++                vTaskDelay(pdMS_TO_TICKS(10));
++            }
++            play_start_us = esp_timer_get_time();
++        }
++
++        if (!p.payload.empty()) {
++            // 재생 큐가 넘치지 않게 실제 재생 속도에 맞춰 넣는다
++            while (IsCurrent(p.turn) &&
++                   queued_us - (esp_timer_get_time() - play_start_us) > kPlaybackLeadUs) {
++                vTaskDelay(pdMS_TO_TICKS(10));
++            }
++            if (!IsCurrent(p.turn)) continue;
++            if (on_incoming_audio_) {
++                auto pkt = std::make_unique<AudioStreamPacket>();
++                pkt->sample_rate = p.sample_rate;
++                pkt->frame_duration = p.frame_duration;
++                pkt->payload = std::move(p.payload);
++                on_incoming_audio_(std::move(pkt));
++            }
++            queued_us += (int64_t)p.frame_duration * 1000;
++        }
++
++        if (p.last && IsCurrent(p.turn)) {
++            // 앞서 넣은 음성이 다 재생될 때쯤 말하기를 끝낸다 (듣기 전환은 재생 큐가 빈 뒤에 일어남)
++            EmitJson("tts", "state", "stop");
++        }
++    }
++}
+diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
+new file mode 100644
+index 0000000..1a60374
+--- /dev/null
++++ b/main/protocols/direct_protocol.h
+@@ -0,0 +1,107 @@
++// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
++// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
++#ifndef DIRECT_PROTOCOL_H
++#define DIRECT_PROTOCOL_H
++
++#include "protocol.h"
++
++#include <web_socket.h>
++#include <http.h>
++#include <esp_timer.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct DirectConfig {
++    std::string deepgram_key;
++    std::string deepseek_key;
++    std::string google_tts_key;
++    std::string llm_model;
++    std::string tts_voice;
++    bool IsComplete() const {
++        return !deepgram_key.empty() && !deepseek_key.empty() && !google_tts_key.empty();
++    }
++    static DirectConfig Load();
++};
++
++class DirectProtocol : public Protocol {
++public:
++    DirectProtocol();
++    ~DirectProtocol() override;
++
++    bool Start() override;
++    bool OpenAudioChannel() override;
++    void CloseAudioChannel(bool send_goodbye = true) override;
++    bool IsAudioChannelOpened() const override;
++    bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) override;
++    void SendWakeWordDetected(const std::string& wake_word) override;
++    void SendStartListening(ListeningMode mode) override;
++    void SendStopListening() override;
++    void SendAbortSpeaking(AbortReason reason) override;
++    void SendMcpMessage(const std::string& message) override;
++
++private:
++    struct Sentence {
++        uint32_t turn;
++        std::string text;
++        bool last;
++    };
++    struct Packet {
++        uint32_t turn;
++        int sample_rate;
++        int frame_duration;
++        std::vector<uint8_t> payload;
++        bool last;
++    };
++
++    DirectConfig config_;
++    std::unique_ptr<WebSocket> asr_ws_;
++    std::atomic<bool> listening_{false};
++    std::atomic<uint32_t> turn_{0};
++    std::atomic<int64_t> last_audio_sent_us_{0};
++    esp_timer_handle_t keepalive_timer_ = nullptr;
++    void* opus_decoder_ = nullptr;
++    std::vector<int16_t> pcm_buf_;
++    std::string utterance_;
++    std::mutex asr_mutex_;
++
++    // 대화 기록 (user/assistant 번갈아)
++    std::deque<std::pair<std::string, std::string>> history_;
++    std::mutex history_mutex_;
++
++    // 작업 큐
++    std::mutex mutex_;
++    std::condition_variable cv_;
++    std::deque<std::pair<uint32_t, std::string>> llm_jobs_;
++    std::deque<Sentence> tts_jobs_;
++    std::deque<Packet> packets_;
++    bool stop_ = false;
++    std::thread llm_thread_, tts_thread_, player_thread_;
++
++    std::unique_ptr<Http> llm_http_;
++    std::unique_ptr<Http> tts_http_;
++
++    bool SendText(const std::string& text) override;
++    bool IsTimeout() const override { return false; }
++
++    void OnAsrMessage(const char* data, size_t len);
++    void FinishUtterance();
++    void EmitJson(const char* type, const char* key1, const char* val1,
++                  const char* key2 = nullptr, const char* val2 = nullptr);
++    void LlmLoop();
++    void TtsLoop();
++    void PlayerLoop();
++    void RunLlm(uint32_t turn, const std::string& user_text);
++    bool Synthesize(uint32_t turn, const std::string& text, bool last);
++    bool IsCurrent(uint32_t turn) const { return turn == turn_.load(); }
++    std::string BuildLlmBody(const std::string& user_text);
++    bool EnsureOpusDecoder();
++};
++
++#endif  // DIRECT_PROTOCOL_H

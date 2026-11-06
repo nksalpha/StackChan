@@ -43,6 +43,18 @@
 - 클라우드 빌드 환경: 개인 환경 `StackChan` (Espressif 서버 3곳 허용)
 - 서버 변경도 개선 범위에 포함. NAS 작업은 사용자가 NAS의 Claude Code로 실행하므로, 필요할 때 실행용 MD를 `docs/nas/`에 써서 넘긴다.
 
+## 서버 없는 직접 연결 펌웨어 (2026-11-06)
+
+사용자 결정으로 NAS 서버를 빼고 기기가 클라우드 API를 직접 부르는 구성을 시도 중. OpenAI Realtime은 비용 때문에 보류.
+
+- 구성: Deepgram 실시간 인식(WebSocket, 말 끝 판정 포함) → DeepSeek 스트리밍 → Google Cloud TTS(OGG_OPUS)
+- TTS 선택 경위: EdgeTTS는 Microsoft가 넣은 난독화 토큰을 역분석한 코드가 필요해서 기기 이식 제외. Azure 대신 사용자가 Google 선택
+- 이미지: `firmware/out/xiaozhi-stackchan-ko-direct-full.bin`
+- 코드: `firmware/patches/03-direct-cloud.patch`(DirectProtocol, Kconfig `DIRECT_CLOUD_MODE`), `04-wifi-connect-api-keys.patch`(설정 화면 고급 탭에 키 3개)
+- 빌드: `bash firmware/build.sh direct`
+- 사용·측정: `docs/DIRECT.md`
+- 상태: 빌드 성공. 기기 테스트 전. 미확인 항목은 `docs/DIRECT.md` 끝에 정리
+
 ## 측정 도구 (2026-11-05 추가, 서버 로그용)
 
 절차는 `docs/MEASURE.md`에 있다.
