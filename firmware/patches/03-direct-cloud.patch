@@ -11,7 +11,7 @@ index 8c318f1..aaa7d9d 100644
              "system_info.cc"
              "application.cc"
 diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
-index 8966dec..6ff0e31 100644
+index 8966dec..f152787 100644
 --- a/main/Kconfig.projbuild
 +++ b/main/Kconfig.projbuild
 @@ -1,5 +1,23 @@
@@ -32,7 +32,7 @@ index 8966dec..6ff0e31 100644
 +
 +config DIRECT_TTS_VOICE
 +    string "Google TTS voice name"
-+    default "ko-KR-Neural2-A"
++    default "ko-KR-Wavenet-A"
 +    depends on DIRECT_CLOUD_MODE
 +
  config OTA_URL
