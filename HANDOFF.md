@@ -30,7 +30,20 @@
 - 원본 펌웨어는 공식 서버에 붙어 있었을 가능성이 높다. 재현 문서에도 원본에서는 OTA URL을 바꾸는 경로를 찾지 못했다고 적혀 있다.
 - 공식 서버는 ASR과 TTS를 스트리밍으로 처리한다. 지금 NAS 서버는 Deepgram을 REST로 호출해서, 말이 끝나고 나서야 인식 결과가 나온다.
 
-## 측정 도구 (2026-11-05 추가)
+## 새 기준 펌웨어 (2026-11-06)
+
+이전 측정 계획은 접고, 새로 빌드한 커스텀 펌웨어를 기준으로 측정·개선한다.
+
+- 이미지: `firmware/out/xiaozhi-stackchan-ko-full.bin` (11,124,461 B, sha256 `904e4def…7e04`)
+- 빌드: ESP-IDF `9a97f6c`(release/v6.1), xiaozhi-esp32 `a73e9a7`, 보드 `m5stack/stackchan`(표정 유지), 언어 `ko-KR`, 버전 2.5.3
+- OTA: `https://nams-nas.tail187299.ts.net/xiaozhi/ota/` (Funnel 유지. 서버와 기기 사용 장소가 다름)
+- 패치: `firmware/patches/` — 구간 지연 로그(`LAT` 태그), 화면 대화 텍스트 숨김
+- 재현: `bash firmware/build.sh` (부품 버전은 `firmware/dependencies.lock`으로 고정)
+- 플래싱·측정: `docs/FLASH_WEB.md` (PC 브라우저, 기기는 사용자가 직접 가지고 있음)
+- 클라우드 빌드 환경: 개인 환경 `StackChan` (Espressif 서버 3곳 허용)
+- 서버 변경도 개선 범위에 포함. NAS 작업은 사용자가 NAS의 Claude Code로 실행하므로, 필요할 때 실행용 MD를 `docs/nas/`에 써서 넘긴다.
+
+## 측정 도구 (2026-11-05 추가, 서버 로그용)
 
 절차는 `docs/MEASURE.md`에 있다.
 

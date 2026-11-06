@@ -28,6 +28,8 @@ cd xiaozhi-esp32
 git checkout -f "$FW_COMMIT"
 git clean -fdq main
 for p in "$REPO"/firmware/patches/*.patch; do git apply "$p"; done
+# 부품 버전을 이 저장소에 기록된 것으로 고정
+cp "$REPO/firmware/dependencies.lock" dependencies.lock
 
 python ./scripts/build.py m5stack/stackchan --language ko-KR
 # build.py가 sdkconfig를 다시 쓰므로 OTA 주소는 그 뒤에 넣고 한 번 더 빌드한다
