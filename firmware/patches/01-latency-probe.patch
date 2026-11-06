@@ -1,0 +1,94 @@
+diff --git a/main/application.cc b/main/application.cc
+index e1f0719..c814b54 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -11,6 +11,7 @@
+ #include "system_info.h"
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
++#include "latency_probe.h"
+ 
+ #include <driver/gpio.h>
+ #include <esp_log.h>
+@@ -88,6 +89,7 @@ void Application::Initialize() {
+         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+     };
+     callbacks.on_vad_change = [this](bool speaking) {
++        if (!speaking) latency_probe::OnVadEnd();  // latency-probe
+         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+     };
+     callbacks.on_playback_drained = [this]() {
+@@ -578,6 +580,7 @@ void Application::InitializeProtocol() {
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+         if (GetDeviceState() == kDeviceStateSpeaking) {
++            latency_probe::OnFirstAudio();  // latency-probe
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+     });
+@@ -647,6 +650,7 @@ void Application::InitializeProtocol() {
+                 return;
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
++                latency_probe::OnTtsStart();  // latency-probe
+                 Schedule([this]() {
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+@@ -685,6 +689,7 @@ void Application::InitializeProtocol() {
+                 if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
+                     glyphs.clear();
+                 }
++                latency_probe::OnStt();  // latency-probe
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+                 Schedule([display, message = std::string(text->valuestring),
+                           glyphs = std::move(glyphs), bpp]() {
+diff --git a/main/latency_probe.h b/main/latency_probe.h
+new file mode 100644
+index 0000000..6f61a97
+--- /dev/null
++++ b/main/latency_probe.h
+@@ -0,0 +1,44 @@
++// latency-probe: 대화 한 턴의 구간별 시간을 시리얼에 한 줄로 찍는다.
++// 출력 예: LAT vad_end>stt=812 stt>tts=640 tts>audio=95 vad_end>audio=1547 (ms)
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <esp_log.h>
++#include <esp_timer.h>
++
++namespace latency_probe {
++
++inline std::atomic<int64_t> g_vad_end{0};
++inline std::atomic<int64_t> g_stt{0};
++inline std::atomic<int64_t> g_tts_start{0};
++inline std::atomic<bool> g_waiting_audio{false};
++
++inline int64_t now_us() { return esp_timer_get_time(); }
++
++// 기기 VAD가 말소리 → 무음으로 바뀐 순간. 말 중간 쉼도 있으므로 마지막 값을 쓴다.
++inline void OnVadEnd() { g_vad_end = now_us(); }
++
++inline void OnStt() {
++    g_stt = now_us();
++    g_tts_start = 0;
++    g_waiting_audio = true;
++}
++
++inline void OnTtsStart() {
++    if (g_tts_start == 0) g_tts_start = now_us();
++}
++
++inline void OnFirstAudio() {
++    bool expected = true;
++    if (!g_waiting_audio.compare_exchange_strong(expected, false)) return;
++    const int64_t t = now_us();
++    const int64_t v = g_vad_end, s = g_stt, ts = g_tts_start;
++    auto d = [](int64_t a, int64_t b) -> long long {
++        return (a > 0 && b >= a) ? (long long)((b - a) / 1000) : -1LL;
++    };
++    ESP_LOGI("LAT", "LAT vad_end>stt=%lld stt>tts=%lld tts>audio=%lld vad_end>audio=%lld",
++             d(v, s), d(s, ts), d(ts, t), d(v, t));
++}
++
++}  // namespace latency_probe

@@ -1,0 +1,12 @@
+diff --git a/main/display/emote_display.cc b/main/display/emote_display.cc
+index ced761f..18298d3 100644
+--- a/main/display/emote_display.cc
++++ b/main/display/emote_display.cc
+@@ -201,6 +201,7 @@ bool EmoteDisplay::SetEmotion(const char* const emotion) {
+ 
+ void EmoteDisplay::SetChatMessage(const char* const role, const char* const content) {
+     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
++    return;  // ko-patch: 화면에 대화 텍스트를 띄우지 않고 표정만 보여준다
+     if (emote_handle_ && content && strlen(content) > 0) {
+         if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
+             size_t len = strlen(content);
