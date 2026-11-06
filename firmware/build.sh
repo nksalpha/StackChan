@@ -48,6 +48,11 @@ if [ "$VARIANT" = "direct" ]; then
   cp -r managed_components/78__esp-wifi-connect components/esp-wifi-connect
   rm -f components/esp-wifi-connect/CHECKSUMS.json components/esp-wifi-connect/.component_hash
   (cd components/esp-wifi-connect && patch -p1 < "$REPO/firmware/patches/04-wifi-connect-api-keys.patch")
+  # HTTP 부품: HTTP/1.1 기본 keep-alive 처리 (Google TTS 연결 재사용)
+  rm -rf components/esp-ml307
+  cp -r managed_components/78__esp-ml307 components/esp-ml307
+  rm -f components/esp-ml307/CHECKSUMS.json components/esp-ml307/.component_hash
+  (cd components/esp-ml307 && patch -p1 < "$REPO/firmware/patches/05-ml307-http11-keepalive.patch")
   git apply "$REPO/firmware/patches/03-direct-cloud.patch"
   sed -i '/CONFIG_DIRECT_CLOUD_MODE/d' sdkconfig
   echo 'CONFIG_DIRECT_CLOUD_MODE=y' >> sdkconfig

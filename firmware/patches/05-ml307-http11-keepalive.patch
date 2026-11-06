@@ -1,0 +1,14 @@
+diff -ru -x CHECKSUMS.json -x .component_hash a/src/http_client.cc b/src/http_client.cc
+--- a/src/http_client.cc	2026-11-06 01:04:26.266848822 +0000
++++ b/src/http_client.cc	2026-11-06 17:34:22.578871794 +0000
+@@ -419,6 +419,10 @@
+     const size_t status_end = line.find_first_of(kSpaces, status_start);
+     const std::string status_str = line.substr(status_start, status_end - status_start);
+ 
++    // direct-cloud: HTTP/1.1은 Connection 헤더가 없어도 기본이 keep-alive다 (RFC 9112 9.3).
++    // Google API처럼 헤더를 생략하는 서버와도 연결을 재사용하게 한다. "close"가 오면 FinishHeaders에서 끈다.
++    server_keep_alive_ = line.compare(version_start, version_end - version_start, "HTTP/1.1") == 0;
++
+     char* endptr;
+     long status = strtol(status_str.c_str(), &endptr, 10);
+ 

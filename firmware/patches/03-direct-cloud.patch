@@ -122,10 +122,10 @@ index c814b54..8b5ff5b 100644
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
 diff --git a/main/idf_component.yml b/main/idf_component.yml
-index c9c64ec..aaf7dd4 100644
+index c9c64ec..91d140a 100644
 --- a/main/idf_component.yml
 +++ b/main/idf_component.yml
-@@ -24,7 +24,10 @@ dependencies:
+@@ -24,11 +24,17 @@ dependencies:
    waveshare/custom_io_expander_ch32v003: ^2.0.0
    espressif/esp_lcd_panel_io_additions: ^1.0.1~1
    78/esp_lcd_nv3023: ==1.0.1
@@ -137,12 +137,20 @@ index c9c64ec..aaf7dd4 100644
    # Stay below the P4 rev>=3.0 CMake gate until rev-1.x boards are retired.
    espressif/esp_audio_effects: ~1.3.0
    espressif/esp_audio_codec: ~2.5.0
+-  78/esp-ml307: ~3.8.1
++  78/esp-ml307:
++    version: ~3.8.1
++    # direct-cloud: HTTP/1.1 기본 keep-alive 처리를 고친 사본
++    override_path: ../components/esp-ml307
+   78/uart-uhci:
+     version: ^0.4.1
+     rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..481ec1e
+index 0000000..4d088cd
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,866 @@
+@@ -0,0 +1,874 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -594,7 +602,7 @@ index 0000000..481ec1e
 +        }
 +        have_text = !utterance_.empty() || !interim_.empty();
 +        if (!had_voice_ || finalize_sent_ || !have_text) return;
-+        if (now - last_voice_us_ < 600 * 1000) return;
++        if (now - last_voice_us_ < 500 * 1000) return;
 +        finalize_sent_ = true;
 +    }
 +    ESP_LOGI(TAG, "ASR +%lld ms device VAD silence, Finalize", (now - listen_start_us_) / 1000);
@@ -906,17 +914,25 @@ index 0000000..481ec1e
 +    if (s) cJSON_free(s);
 +    cJSON_Delete(root);
 +
-+    http->SetTimeout(10000);
-+    http->SetHeader("Content-Type", "application/json");
-+    http->SetHeader("X-Goog-Api-Key", config_.google_tts_key);
-+    http->SetContent(std::move(body));
-+    if (!http->Open("POST", kTtsUrl)) {
-+        ESP_LOGE(TAG, "TTS open failed");
++    // 재사용하려던 연결을 서버가 이미 닫았을 수 있으므로 한 번은 새 연결로 다시 시도한다
++    NetworkResult<int> status = std::unexpected(NetworkError::InvalidArgument());
++    std::string resp;
++    for (int attempt = 0; attempt < 2; attempt++) {
++        http->SetTimeout(10000);
++        http->SetHeader("Content-Type", "application/json");
++        http->SetHeader("X-Goog-Api-Key", config_.google_tts_key);
++        http->SetContent(std::string(body));
++        if (!http->Open("POST", kTtsUrl)) {
++            ESP_LOGW(TAG, "TTS open failed (attempt %d)", attempt + 1);
++            http->Close();
++            continue;
++        }
++        status = http->GetStatusCode();
++        resp = http->ReadAll();
++        if (status) break;  // HTTP 응답을 받았으면 상태 코드와 상관없이 재시도하지 않는다
++        ESP_LOGW(TAG, "TTS no response (attempt %d)", attempt + 1);
 +        http->Close();
-+        return false;
 +    }
-+    auto status = http->GetStatusCode();
-+    std::string resp = http->ReadAll();
 +    if (!status || *status != 200) {
 +        ESP_LOGE(TAG, "TTS status %d: %.200s", status ? *status : -1, resp.c_str());
 +        http->Close();
