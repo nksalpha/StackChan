@@ -39,7 +39,7 @@ index 8966dec..f152787 100644
      string "Default OTA URL"
      default "https://api.tenclass.net/xiaozhi/ota/"
 diff --git a/main/application.cc b/main/application.cc
-index c814b54..8b5ff5b 100644
+index c814b54..0461bef 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -12,6 +12,11 @@
@@ -87,17 +87,18 @@ index c814b54..8b5ff5b 100644
  
      // Initialize the protocol
      InitializeProtocol();
-@@ -562,6 +580,9 @@ void Application::InitializeProtocol() {
+@@ -562,6 +580,10 @@ void Application::InitializeProtocol() {
  
      display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
  
 +#if CONFIG_DIRECT_CLOUD_MODE
 +    protocol_ = std::make_unique<DirectProtocol>();
++    audio_service_.SetPcmPassthrough(true);
 +#else
      if (ota_->HasMqttConfig()) {
          protocol_ = std::make_unique<MqttProtocol>();
      } else if (ota_->HasWebsocketConfig()) {
-@@ -570,6 +591,7 @@ void Application::InitializeProtocol() {
+@@ -570,6 +592,7 @@ void Application::InitializeProtocol() {
          ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
          protocol_ = std::make_unique<MqttProtocol>();
      }
@@ -105,7 +106,7 @@ index c814b54..8b5ff5b 100644
  
      protocol_->OnConnected([this]() { DismissAlert(); });
  
-@@ -752,7 +774,15 @@ void Application::InitializeProtocol() {
+@@ -752,7 +775,15 @@ void Application::InitializeProtocol() {
          }
      });
  
@@ -121,6 +122,54 @@ index c814b54..8b5ff5b 100644
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 358a094..6a4516a 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -474,7 +474,21 @@ void AudioService::OpusCodecTask() {
+             packet->sample_rate = 16000;
+             packet->timestamp = task.timestamp;
+ 
+-            if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
++            if (pcm_passthrough_ && task.type == kAudioTaskTypeEncodeToSendQueue) {
++                // direct-cloud: 압축 없이 PCM16 원음을 그대로 넘긴다 (인식 정확도 우선)
++                packet->payload.resize(task.pcm.size() * sizeof(int16_t));
++                memcpy(packet->payload.data(), task.pcm.data(), packet->payload.size());
++                {
++                    std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
++                    if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
++                        audio_send_queue_.pop_front();
++                    }
++                    audio_send_queue_.push_back(std::move(packet));
++                }
++                if (callbacks_.on_send_queue_available) {
++                    callbacks_.on_send_queue_available();
++                }
++            } else if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
+                 packet->payload.resize(encoder_outbuf_size_);
+                 esp_audio_enc_in_frame_t in = {
+                     .buffer = (uint8_t*)(task.pcm.data()),
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index b79d033..5fd459c 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -124,6 +124,8 @@ public:
+     const std::string& GetLastWakeWord() const;
+     std::vector<std::string> GetWakeWords() const;
+     bool IsVoiceDetected() const { return voice_detected_; }
++    // direct-cloud: 마이크 음성을 Opus로 압축하지 않고 PCM16 그대로 보낸다
++    void SetPcmPassthrough(bool enable) { pcm_passthrough_ = enable; }
+     bool IsIdle();
+     bool IsPlaybackIdle();
+     bool IsWakeWordRunning() const {
+@@ -200,6 +202,7 @@ private:
+ 
+     bool audio_engine_initialized_ = false;
+     bool voice_detected_ = false;
++    std::atomic<bool> pcm_passthrough_{false};
+ #if CONFIG_USE_DEVICE_AEC
+     bool device_aec_enabled_ = true;
+ #else
 diff --git a/main/idf_component.yml b/main/idf_component.yml
 index c9c64ec..91d140a 100644
 --- a/main/idf_component.yml
@@ -147,10 +196,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..b0da161
+index 0000000..65f750a
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,919 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -188,7 +237,7 @@ index 0000000..b0da161
 +
 +const char* kDeepgramUrl =
 +    "wss://api.deepgram.com/v1/listen?model=nova-3&language=ko&encoding=linear16"
-+    "&sample_rate=16000&channels=1&interim_results=true&endpointing=300"
++    "&sample_rate=16000&channels=1&interim_results=true&endpointing=800"
 +    "&utterance_end_ms=1000&smart_format=true&punctuate=true";
 +const char* kDeepseekUrl = "https://api.deepseek.com/chat/completions";
 +const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
@@ -475,25 +524,9 @@ index 0000000..b0da161
 +
 +bool DirectProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 +    if (!listening_ || !asr_ws_ || !asr_ws_->IsConnected()) return true;
-+    if (!EnsureOpusDecoder()) return false;
-+
-+    esp_audio_dec_in_raw_t raw = {
-+        .buffer = packet->payload.data(),
-+        .len = (uint32_t)packet->payload.size(),
-+        .consumed = 0,
-+        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
-+    };
-+    esp_audio_dec_out_frame_t out = {
-+        .buffer = (uint8_t*)pcm_buf_.data(),
-+        .len = (uint32_t)(pcm_buf_.size() * sizeof(int16_t)),
-+        .decoded_size = 0,
-+    };
-+    esp_audio_dec_info_t info = {};
-+    if (esp_opus_dec_decode(opus_decoder_, &raw, &out, &info) != ESP_AUDIO_ERR_OK) {
-+        return true;
-+    }
++    // AudioService가 PCM16(16kHz, mono) 원음을 그대로 넘겨준다 (SetPcmPassthrough)
 +    last_audio_sent_us_ = esp_timer_get_time();
-+    return asr_ws_->Send(pcm_buf_.data(), out.decoded_size, true);
++    return asr_ws_->Send(packet->payload.data(), packet->payload.size(), true);
 +}
 +
 +void DirectProtocol::SendStartListening(ListeningMode mode) {
@@ -607,7 +640,7 @@ index 0000000..b0da161
 +        have_text = !utterance_.empty() || !interim_.empty();
 +        // 글자가 아직 안 왔어도 Deepgram이 받은 음성으로 마무리하게 한다
 +        if (!had_voice_ || finalize_sent_) return;
-+        if (now - last_voice_us_ < 500 * 1000) return;
++        if (now - last_voice_us_ < 1000 * 1000) return;
 +        finalize_sent_ = true;
 +    }
 +    ESP_LOGI(TAG, "ASR +%lld ms device VAD silence, Finalize%s", (now - listen_start_us_) / 1000,
@@ -646,6 +679,11 @@ index 0000000..b0da161
 +    cJSON_AddStringToObject(root, "model", config_.llm_model.c_str());
 +    cJSON_AddBoolToObject(root, "stream", true);
 +    cJSON_AddNumberToObject(root, "max_tokens", 300);
++    if (thinking_param_ok_) {
++        // 짧은 잡담에는 추론 단계가 필요 없다. 서버가 이 옵션을 모르면 RunLlm에서 빼고 다시 보낸다.
++        cJSON* thinking = cJSON_AddObjectToObject(root, "thinking");
++        cJSON_AddStringToObject(thinking, "type", "disabled");
++    }
 +    cJSON* msgs = cJSON_AddArrayToObject(root, "messages");
 +    auto add = [msgs](const char* role, const std::string& content) {
 +        cJSON* m = cJSON_CreateObject();
@@ -695,7 +733,21 @@ index 0000000..b0da161
 +                std::string body = llm_http_->ReadAll();
 +                ESP_LOGI(TAG, "Warmup DeepSeek status=%d in %lld ms", st ? *st : -1,
 +                         (esp_timer_get_time() - t0) / 1000);
-+                if (!st || *st != 200) ESP_LOGE(TAG, "DeepSeek: %.200s", body.c_str());
++                if (!st || *st != 200) {
++                    ESP_LOGE(TAG, "DeepSeek: %.200s", body.c_str());
++                } else if (job.second == "asr") {
++                    // 처음 한 번만: 이 키로 쓸 수 있는 모델 이름을 남긴다
++                    cJSON* j = cJSON_Parse(body.c_str());
++                    auto data = j ? cJSON_GetObjectItem(j, "data") : nullptr;
++                    std::string ids;
++                    cJSON* m = nullptr;
++                    cJSON_ArrayForEach(m, data) {
++                        auto id = cJSON_GetObjectItem(m, "id");
++                        if (cJSON_IsString(id)) { ids += id->valuestring; ids += " "; }
++                    }
++                    if (j) cJSON_Delete(j);
++                    ESP_LOGI(TAG, "DeepSeek models: %s", ids.c_str());
++                }
 +            } else {
 +                llm_http_->Close();
 +            }
@@ -714,10 +766,14 @@ index 0000000..b0da161
 +    }
 +    auto& http = llm_http_;
 +    http->SetTimeout(15000);
-+    http->SetHeader("Authorization", "Bearer " + config_.deepseek_key);
-+    http->SetHeader("Content-Type", "application/json");
-+    http->SetHeader("Accept", "text/event-stream");
-+    http->SetContent(BuildLlmBody(user_text));
++    auto prepare = [&]() {
++        http->SetTimeout(15000);
++        http->SetHeader("Authorization", "Bearer " + config_.deepseek_key);
++        http->SetHeader("Content-Type", "application/json");
++        http->SetHeader("Accept", "text/event-stream");
++        http->SetContent(BuildLlmBody(user_text));
++    };
++    prepare();
 +
 +    auto finish_with_error = [&](const char* msg) {
 +        ESP_LOGE(TAG, "%s", msg);
@@ -734,6 +790,18 @@ index 0000000..b0da161
 +        return;
 +    }
 +    auto status = http->GetStatusCode();
++    if (status && *status == 400 && thinking_param_ok_) {
++        // 추론 끄기 옵션을 받아주지 않는 모델: 옵션을 빼고 한 번 더
++        std::string body = http->ReadAll();
++        ESP_LOGW(TAG, "DeepSeek rejected thinking option, retrying without: %.200s", body.c_str());
++        thinking_param_ok_ = false;
++        prepare();
++        if (!http->Open("POST", kDeepseekUrl)) {
++            finish_with_error("DeepSeek open failed");
++            return;
++        }
++        status = http->GetStatusCode();
++    }
 +    if (!status || *status != 200) {
 +        std::string body = http->ReadAll();
 +        ESP_LOGE(TAG, "DeepSeek status %d: %.200s", status ? *status : -1, body.c_str());
@@ -1053,10 +1121,10 @@ index 0000000..b0da161
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..10624d8
+index 0000000..c91c205
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,126 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1158,6 +1226,7 @@ index 0000000..10624d8
 +    bool stop_ = false;
 +    std::thread llm_thread_, tts_thread_, player_thread_;
 +
++    std::atomic<bool> thinking_param_ok_{true};
 +    std::unique_ptr<Http> llm_http_;
 +    std::unique_ptr<Http> tts_http_;
 +
