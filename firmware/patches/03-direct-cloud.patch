@@ -11,7 +11,7 @@ index 8c318f1..aaa7d9d 100644
              "system_info.cc"
              "application.cc"
 diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
-index 8966dec..f152787 100644
+index 8966dec..edc09ae 100644
 --- a/main/Kconfig.projbuild
 +++ b/main/Kconfig.projbuild
 @@ -1,5 +1,23 @@
@@ -32,7 +32,7 @@ index 8966dec..f152787 100644
 +
 +config DIRECT_TTS_VOICE
 +    string "Google TTS voice name"
-+    default "ko-KR-Wavenet-A"
++    default "ko-KR-Chirp3-HD-Kore"
 +    depends on DIRECT_CLOUD_MODE
 +
  config OTA_URL
@@ -196,10 +196,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..52560b6
+index 0000000..b01ff26
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,954 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -241,6 +241,7 @@ index 0000000..52560b6
 +    "&utterance_end_ms=1000&smart_format=true&punctuate=true";
 +const char* kDeepseekUrl = "https://api.deepseek.com/chat/completions";
 +const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
++const char* kFallbackVoice = "ko-KR-Wavenet-A";  // 설정한 음성이 거부되면 이걸로
 +
 +const char* kSystemPrompt =
 +    "너는 책상 위에 사는 작은 로봇 스택짱이야.\n"
@@ -1000,38 +1001,53 @@ index 0000000..52560b6
 +    }
 +    auto& http = tts_http_;
 +
-+    cJSON* root = cJSON_CreateObject();
-+    cJSON* input = cJSON_AddObjectToObject(root, "input");
-+    cJSON_AddStringToObject(input, "text", text.c_str());
-+    cJSON* voice = cJSON_AddObjectToObject(root, "voice");
-+    cJSON_AddStringToObject(voice, "languageCode", "ko-KR");
-+    cJSON_AddStringToObject(voice, "name", config_.tts_voice.c_str());
-+    cJSON* ac = cJSON_AddObjectToObject(root, "audioConfig");
-+    cJSON_AddStringToObject(ac, "audioEncoding", "OGG_OPUS");
-+    cJSON_AddNumberToObject(ac, "sampleRateHertz", kTtsSampleRate);
-+    char* s = cJSON_PrintUnformatted(root);
-+    std::string body = s ? s : "";
-+    if (s) cJSON_free(s);
-+    cJSON_Delete(root);
++    auto make_body = [&](const std::string& voice_name) {
++        cJSON* root = cJSON_CreateObject();
++        cJSON* input = cJSON_AddObjectToObject(root, "input");
++        cJSON_AddStringToObject(input, "text", text.c_str());
++        cJSON* voice = cJSON_AddObjectToObject(root, "voice");
++        cJSON_AddStringToObject(voice, "languageCode", "ko-KR");
++        cJSON_AddStringToObject(voice, "name", voice_name.c_str());
++        cJSON* ac = cJSON_AddObjectToObject(root, "audioConfig");
++        cJSON_AddStringToObject(ac, "audioEncoding", "OGG_OPUS");
++        cJSON_AddNumberToObject(ac, "sampleRateHertz", kTtsSampleRate);
++        char* s = cJSON_PrintUnformatted(root);
++        std::string body = s ? s : "";
++        if (s) cJSON_free(s);
++        cJSON_Delete(root);
++        return body;
++    };
 +
 +    // 재사용하려던 연결을 서버가 이미 닫았을 수 있으므로 한 번은 새 연결로 다시 시도한다
-+    NetworkResult<int> status = std::unexpected(NetworkError::InvalidArgument());
-+    std::string resp;
-+    for (int attempt = 0; attempt < 2; attempt++) {
-+        http->SetTimeout(10000);
-+        http->SetHeader("Content-Type", "application/json");
-+        http->SetHeader("X-Goog-Api-Key", config_.google_tts_key);
-+        http->SetContent(std::string(body));
-+        if (!http->Open("POST", kTtsUrl)) {
-+            ESP_LOGW(TAG, "TTS open failed (attempt %d)", attempt + 1);
++    auto request = [&](const std::string& body, std::string& resp) -> NetworkResult<int> {
++        NetworkResult<int> status = std::unexpected(NetworkError::InvalidArgument());
++        for (int attempt = 0; attempt < 2; attempt++) {
++            http->SetTimeout(10000);
++            http->SetHeader("Content-Type", "application/json");
++            http->SetHeader("X-Goog-Api-Key", config_.google_tts_key);
++            http->SetContent(std::string(body));
++            if (!http->Open("POST", kTtsUrl)) {
++                ESP_LOGW(TAG, "TTS open failed (attempt %d)", attempt + 1);
++                http->Close();
++                continue;
++            }
++            status = http->GetStatusCode();
++            resp = http->ReadAll();
++            if (status) break;  // HTTP 응답을 받았으면 상태 코드와 상관없이 재시도하지 않는다
++            ESP_LOGW(TAG, "TTS no response (attempt %d)", attempt + 1);
 +            http->Close();
-+            continue;
 +        }
-+        status = http->GetStatusCode();
-+        resp = http->ReadAll();
-+        if (status) break;  // HTTP 응답을 받았으면 상태 코드와 상관없이 재시도하지 않는다
-+        ESP_LOGW(TAG, "TTS no response (attempt %d)", attempt + 1);
-+        http->Close();
++        return status;
++    };
++
++    std::string resp;
++    auto status = request(make_body(config_.tts_voice), resp);
++    if (status && *status == 400 && config_.tts_voice != kFallbackVoice) {
++        // 음성 이름이 틀렸거나 이 음성이 요청 형식을 받지 않는 경우: 기본 음성으로 바꿔서 계속 말하게 한다
++        ESP_LOGW(TAG, "TTS voice %s rejected (%.160s), falling back to %s", config_.tts_voice.c_str(),
++                 resp.c_str(), kFallbackVoice);
++        config_.tts_voice = kFallbackVoice;
++        status = request(make_body(config_.tts_voice), resp);
 +    }
 +    if (!status || *status != 200) {
 +        ESP_LOGE(TAG, "TTS status %d: %.200s", status ? *status : -1, resp.c_str());
