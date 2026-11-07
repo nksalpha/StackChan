@@ -185,10 +185,10 @@ index b79d033..cd06ad5 100644
  #else
 diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
 new file mode 100644
-index 0000000..9c291e4
+index 0000000..7088010
 --- /dev/null
 +++ b/main/boards/m5stack/stackchan/reactions.h
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,375 @@
 +// direct-cloud: 터치·흔들기 반응과 대기 중 표정 변화
 +//
 +// - 터치 (FT6336, 0x38): 톡 치기 / 쓰다듬기(길게) / 간지럼(문지르기) / 여러 번 콕콕
@@ -209,6 +209,7 @@ index 0000000..9c291e4
 +#include <freertos/task.h>
 +
 +#include <cmath>
++#include <cstring>
 +#include <functional>
 +#include <string>
 +#include <vector>
@@ -220,64 +221,108 @@ index 0000000..9c291e4
 +
 +static const char* const RTAG = "Reactions";
 +
-+// 터치 칩. 손가락 수와 첫 손가락 좌표만 읽는다.
-+class TouchPanel : public I2cDevice {
++// 공용 I2cDevice는 통신 실패 시 기기를 강제 종료(ESP_ERROR_CHECK)하므로,
++// 반응용 센서는 실패해도 그 회차만 건너뛰는 전용 함수를 쓴다.
++class SafeI2c : public I2cDevice {
 +public:
-+    TouchPanel(i2c_master_bus_handle_t bus, uint8_t addr) : I2cDevice(bus, addr) {}
++    SafeI2c(i2c_master_bus_handle_t bus, uint8_t addr) : I2cDevice(bus, addr) {}
++
++protected:
++    bool Write(uint8_t reg, uint8_t value) {
++        uint8_t buf[2] = {reg, value};
++        return i2c_master_transmit(i2c_device_, buf, 2, 100) == ESP_OK;
++    }
++    bool WriteBurst(uint8_t reg, const uint8_t* data, size_t len) {
++        uint8_t buf[65];
++        if (len > 64) return false;
++        buf[0] = reg;
++        memcpy(buf + 1, data, len);
++        return i2c_master_transmit(i2c_device_, buf, len + 1, 100) == ESP_OK;
++    }
++    bool Read(uint8_t reg, uint8_t* out, size_t len) {
++        return i2c_master_transmit_receive(i2c_device_, &reg, 1, out, len, 100) == ESP_OK;
++    }
++};
++
++// 터치 칩. 손가락 수와 첫 손가락 좌표만 읽는다.
++class TouchPanel : public SafeI2c {
++public:
++    TouchPanel(i2c_master_bus_handle_t bus, uint8_t addr) : SafeI2c(bus, addr) {}
 +    bool Read(int& num, int& x, int& y) {
 +        uint8_t buf[5] = {0};
-+        ReadRegs(0x02, buf, sizeof(buf));
++        if (!SafeI2c::Read(0x02, buf, sizeof(buf))) return false;  // 실패하면 이번 회차는 건너뜀
 +        num = buf[0] & 0x0F;
 +        x = ((buf[1] & 0x0F) << 8) | buf[2];
 +        y = ((buf[3] & 0x0F) << 8) | buf[4];
 +        return num <= 2;
 +    }
-+    uint8_t ChipId() { return ReadReg(0xA3); }
++    uint8_t ChipId() {
++        uint8_t id = 0;
++        SafeI2c::Read(0xA3, &id, 1);
++        return id;
++    }
 +};
 +
 +// 가속도만 쓰는 최소 BMI270 드라이버 (설정 파일을 올린 뒤 가속도계만 켠다)
-+class Accel : public I2cDevice {
++class Accel : public SafeI2c {
 +public:
-+    Accel(i2c_master_bus_handle_t bus, uint8_t addr) : I2cDevice(bus, addr) {}
++    Accel(i2c_master_bus_handle_t bus, uint8_t addr) : SafeI2c(bus, addr) {}
 +
 +    bool Begin() {
-+        if (ReadReg(0x00) != 0x24) {  // CHIP_ID
-+            ESP_LOGW(RTAG, "BMI270 not found");
-+            return false;
++        for (int attempt = 1; attempt <= 3; attempt++) {
++            if (TryBegin()) {
++                ESP_LOGI(RTAG, "BMI270 ready");
++                return true;
++            }
++            ESP_LOGW(RTAG, "BMI270 init failed (attempt %d)", attempt);
++            vTaskDelay(pdMS_TO_TICKS(20));
 +        }
-+        WriteReg(0x7E, 0xB6);  // soft reset
-+        vTaskDelay(pdMS_TO_TICKS(5));
-+        WriteReg(0x7C, 0x00);  // PWR_CONF: advanced power save off
-+        vTaskDelay(pdMS_TO_TICKS(1));
-+        WriteReg(0x59, 0x00);  // INIT_CTRL: start config load
-+        const size_t kChunk = 64;
-+        for (size_t off = 0; off < 8192; off += kChunk) {
-+            WriteReg(0x5B, (uint8_t)((off / 2) & 0x0F));  // INIT_ADDR_0
-+            WriteReg(0x5C, (uint8_t)((off / 2) >> 4));    // INIT_ADDR_1
-+            WriteRegs(0x5E, bmi270_config_file + off, kChunk);  // INIT_DATA
-+        }
-+        WriteReg(0x59, 0x01);  // INIT_CTRL: done
-+        vTaskDelay(pdMS_TO_TICKS(30));
-+        uint8_t status = ReadReg(0x21) & 0x0F;  // INTERNAL_STATUS
-+        if (status != 0x01) {
-+            ESP_LOGW(RTAG, "BMI270 init status 0x%02X", status);
-+            return false;
-+        }
-+        WriteReg(0x7D, 0x04);  // PWR_CTRL: accel on
-+        WriteReg(0x40, 0xA8);  // ACC_CONF: 100Hz, normal, performance
-+        WriteReg(0x41, 0x01);  // ACC_RANGE: ±4g (8192 LSB/g)
-+        vTaskDelay(pdMS_TO_TICKS(10));
-+        ESP_LOGI(RTAG, "BMI270 ready");
-+        return true;
++        return false;  // 흔들기 반응만 꺼지고 나머지는 정상 동작
 +    }
 +
-+    // 단위: g
-+    void Read(float& x, float& y, float& z) {
++    // 단위: g. 읽기에 실패하면 false
++    bool Read(float& x, float& y, float& z) {
 +        uint8_t b[6];
-+        ReadRegs(0x0C, b, 6);
++        if (!SafeI2c::Read(0x0C, b, 6)) return false;
 +        x = (int16_t)(b[0] | (b[1] << 8)) / 8192.0f;
 +        y = (int16_t)(b[2] | (b[3] << 8)) / 8192.0f;
 +        z = (int16_t)(b[4] | (b[5] << 8)) / 8192.0f;
++        return true;
++    }
++
++private:
++    bool TryBegin() {
++        uint8_t id = 0;
++        if (!SafeI2c::Read(0x00, &id, 1) || id != 0x24) {  // CHIP_ID
++            ESP_LOGW(RTAG, "BMI270 not found (id 0x%02X)", id);
++            return false;
++        }
++        Write(0x7E, 0xB6);  // soft reset: 칩이 바로 재시작해서 응답이 없을 수 있으므로 결과는 보지 않는다
++        vTaskDelay(pdMS_TO_TICKS(5));
++        if (!Write(0x7C, 0x00)) return false;  // PWR_CONF: advanced power save off
++        vTaskDelay(pdMS_TO_TICKS(1));
++        if (!Write(0x59, 0x00)) return false;  // INIT_CTRL: start config load
++        const size_t kChunk = 64;
++        for (size_t off = 0; off < 8192; off += kChunk) {
++            if (!Write(0x5B, (uint8_t)((off / 2) & 0x0F)) ||  // INIT_ADDR_0
++                !Write(0x5C, (uint8_t)((off / 2) >> 4)) ||    // INIT_ADDR_1
++                !WriteBurst(0x5E, bmi270_config_file + off, kChunk)) {  // INIT_DATA
++                return false;
++            }
++        }
++        if (!Write(0x59, 0x01)) return false;  // INIT_CTRL: done
++        vTaskDelay(pdMS_TO_TICKS(30));
++        uint8_t status = 0;
++        SafeI2c::Read(0x21, &status, 1);  // INTERNAL_STATUS
++        if ((status & 0x0F) != 0x01) {
++            ESP_LOGW(RTAG, "BMI270 init status 0x%02X", status);
++            return false;
++        }
++        if (!Write(0x7D, 0x04)) return false;  // PWR_CTRL: accel on
++        if (!Write(0x40, 0xA8)) return false;  // ACC_CONF: 100Hz, normal, performance
++        if (!Write(0x41, 0x01)) return false;  // ACC_RANGE: ±4g (8192 LSB/g)
++        vTaskDelay(pdMS_TO_TICKS(10));
++        return true;
 +    }
 +};
 +
@@ -496,7 +541,7 @@ index 0000000..9c291e4
 +
 +    void PollShake(int64_t now, DeviceState state, bool allowed) {
 +        float ax, ay, az;
-+        accel_->Read(ax, ay, az);
++        if (!accel_->Read(ax, ay, az)) return;  // 통신이 튀면 이번 회차는 건너뜀
 +        float mag = std::sqrt(ax * ax + ay * ay + az * az);
 +        float dev = std::fabs(mag - 1.0f);  // 가만히 있으면 1g
 +        if (now - shake_window_us_ > 800 * 1000) {
