@@ -185,10 +185,10 @@ index b79d033..cd06ad5 100644
  #else
 diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
 new file mode 100644
-index 0000000..aade8f8
+index 0000000..8d06394
 --- /dev/null
 +++ b/main/boards/m5stack/stackchan/reactions.h
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,295 @@
 +// direct-cloud: 터치·흔들기 반응과 대기 중 표정 변화
 +//
 +// - 터치 (FT6336, 0x38): 톡 치기 / 쓰다듬기(길게) / 간지럼(문지르기) / 여러 번 콕콕
@@ -309,6 +309,7 @@ index 0000000..aade8f8
 +    int64_t touch_start_us_ = 0;
 +    int touch_x0_ = 0, touch_x_min_ = 0, touch_x_max_ = 0;
 +    bool long_press_shown_ = false;
++    int zero_reads_ = 0;  // 손을 대고 있어도 칩이 가끔 0을 돌려주므로 연속으로 비어야 뗀 것으로 본다
 +    int64_t tap_times_[4] = {0};
 +
 +    // 흔들기 상태
@@ -402,6 +403,11 @@ index 0000000..aade8f8
 +    void PollTouch(int64_t now, DeviceState state, bool allowed) {
 +        int num = 0, x = 0, y = 0;
 +        if (!touch_->Read(num, x, y)) return;
++        if (num > 0) {
++            zero_reads_ = 0;
++        } else if (touching_ && ++zero_reads_ < 4) {
++            return;  // 200ms 동안 계속 비어 있을 때만 손을 뗀 것으로 본다
++        }
 +        if (num > 0 && !touching_) {
 +            touching_ = true;
 +            touch_start_us_ = now;
@@ -411,12 +417,12 @@ index 0000000..aade8f8
 +            if (x < touch_x_min_) touch_x_min_ = x;
 +            if (x > touch_x_max_) touch_x_max_ = x;
 +            // 좌우로 문지르면 간지럼
-+            if (allowed && !long_press_shown_ && touch_x_max_ - touch_x_min_ > 120) {
++            if (allowed && !long_press_shown_ && touch_x_max_ - touch_x_min_ > 80) {
 +                long_press_shown_ = true;
 +                Show("laughing", 2500, state);
 +            }
 +            // 가만히 오래 대고 있으면 쓰다듬기
-+            if (allowed && !long_press_shown_ && now - touch_start_us_ > 800 * 1000) {
++            if (allowed && !long_press_shown_ && now - touch_start_us_ > 700 * 1000) {
 +                long_press_shown_ = true;
 +                SetFace("relaxed");
 +                revert_at_us_ = 0;
@@ -424,11 +430,13 @@ index 0000000..aade8f8
 +            }
 +        } else if (num == 0 && touching_) {
 +            touching_ = false;
-+            int64_t held = now - touch_start_us_;
++            // 뗀 시각은 마지막으로 닿아 있던 때 (빈 읽기 4번을 기다린 시간은 뺀다)
++            int64_t held = now - touch_start_us_ - 4 * 50 * 1000;
++            ESP_LOGI(RTAG, "Touch held=%lld ms dx=%d", held / 1000, touch_x_max_ - touch_x_min_);
 +            if (!allowed) return;
 +            if (long_press_shown_) {
 +                // 쓰다듬기가 끝나면 좋아하는 얼굴
-+                if (held > 800 * 1000 && touch_x_max_ - touch_x_min_ <= 120) Show("loving", 2500, state);
++                if (held > 700 * 1000 && touch_x_max_ - touch_x_min_ <= 80) Show("loving", 2500, state);
 +                else if (revert_at_us_ == 0) Show("happy", 1500, state);
 +                return;
 +            }
