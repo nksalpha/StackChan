@@ -56,6 +56,8 @@ if [ "$VARIANT" = "direct" ]; then
   git apply "$REPO/firmware/patches/03-direct-cloud.patch"
   sed -i '/CONFIG_DIRECT_CLOUD_MODE/d' sdkconfig
   echo 'CONFIG_DIRECT_CLOUD_MODE=y' >> sdkconfig
+  # 원음(초당 32KB)을 해외 서버로 실시간 전송하려면 기본 TCP 송신 버퍼(5.7KB)로는 모자라다
+  sed -i 's/^CONFIG_LWIP_TCP_SND_BUF_DEFAULT=.*/CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384/' sdkconfig
   OUT_NAME=xiaozhi-stackchan-ko-direct-full.bin
 fi
 idf.py build

@@ -196,10 +196,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..65f750a
+index 0000000..52560b6
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,938 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -525,8 +525,24 @@ index 0000000..65f750a
 +bool DirectProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 +    if (!listening_ || !asr_ws_ || !asr_ws_->IsConnected()) return true;
 +    // AudioService가 PCM16(16kHz, mono) 원음을 그대로 넘겨준다 (SetPcmPassthrough)
-+    last_audio_sent_us_ = esp_timer_get_time();
-+    return asr_ws_->Send(packet->payload.data(), packet->payload.size(), true);
++    int64_t t0 = esp_timer_get_time();
++    last_audio_sent_us_ = t0;
++    bool ok = asr_ws_->Send(packet->payload.data(), packet->payload.size(), true);
++    int64_t dt = esp_timer_get_time() - t0;
++
++    // 업로드가 실시간을 따라가는지 3초마다 기록 (audio가 wall보다 많이 작으면 밀리는 중)
++    up_audio_ms_ += packet->payload.size() / (kUpSampleRate / 1000 * 2);
++    if (dt > up_max_send_us_) up_max_send_us_ = dt;
++    if (up_window_start_us_ == 0) up_window_start_us_ = t0;
++    int64_t wall = esp_timer_get_time() - up_window_start_us_;
++    if (wall > 3 * 1000 * 1000) {
++        ESP_LOGI(TAG, "UP audio=%lld ms wall=%lld ms slowest_send=%lld ms", up_audio_ms_,
++                 wall / 1000, up_max_send_us_ / 1000);
++        up_audio_ms_ = 0;
++        up_max_send_us_ = 0;
++        up_window_start_us_ = esp_timer_get_time();
++    }
++    return ok;
 +}
 +
 +void DirectProtocol::SendStartListening(ListeningMode mode) {
@@ -537,6 +553,9 @@ index 0000000..65f750a
 +    last_voice_us_ = 0;
 +    had_voice_ = false;
 +    finalize_sent_ = false;
++    up_audio_ms_ = 0;
++    up_max_send_us_ = 0;
++    up_window_start_us_ = 0;
 +    listening_ = true;
 +}
 +
@@ -1121,10 +1140,10 @@ index 0000000..65f750a
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..c91c205
+index 0000000..21ba930
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1212,6 +1231,9 @@ index 0000000..c91c205
 +    int64_t last_voice_us_ = 0;
 +    bool had_voice_ = false;
 +    bool finalize_sent_ = false;
++    int64_t up_audio_ms_ = 0;
++    int64_t up_max_send_us_ = 0;
++    int64_t up_window_start_us_ = 0;
 +
 +    // 대화 기록 (user/assistant 번갈아)
 +    std::deque<std::pair<std::string, std::string>> history_;
