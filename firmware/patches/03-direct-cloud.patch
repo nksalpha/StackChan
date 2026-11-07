@@ -185,10 +185,10 @@ index b79d033..cd06ad5 100644
  #else
 diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
 new file mode 100644
-index 0000000..8d06394
+index 0000000..90e9dc6
 --- /dev/null
 +++ b/main/boards/m5stack/stackchan/reactions.h
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,308 @@
 +// direct-cloud: 터치·흔들기 반응과 대기 중 표정 변화
 +//
 +// - 터치 (FT6336, 0x38): 톡 치기 / 쓰다듬기(길게) / 간지럼(문지르기) / 여러 번 콕콕
@@ -320,6 +320,7 @@ index 0000000..8d06394
 +    // 대기 상태
 +    DeviceState last_state_ = kDeviceStateUnknown;
 +    int64_t state_since_us_ = 0;
++    int64_t last_activity_us_ = 0;  // 마지막으로 대화하거나 만지거나 흔든 시각 (졸림 판단 기준)
 +    int64_t next_idle_fx_us_ = 0;
 +    bool sleepy_ = false;
 +
@@ -349,6 +350,7 @@ index 0000000..8d06394
 +        revert_to_ = BaseFace(s);
 +        revert_at_us_ = Now() + (int64_t)ms * 1000;
 +        sleepy_ = false;
++        last_activity_us_ = Now();  // 놀아 주면 잠이 깬다
 +        next_idle_fx_us_ = Now() + 15LL * 1000 * 1000;
 +        if (on_activity_) on_activity_();
 +    }
@@ -362,6 +364,7 @@ index 0000000..8d06394
 +            if (state != last_state_) {
 +                last_state_ = state;
 +                state_since_us_ = now;
++                last_activity_us_ = now;
 +                sleepy_ = false;
 +                next_idle_fx_us_ = now + (15 + Rand(20)) * 1000000LL;
 +                revert_at_us_ = 0;
@@ -381,12 +384,20 @@ index 0000000..8d06394
 +                chained_.clear();
 +            } else if (revert_at_us_ && now >= revert_at_us_ && chained_.empty()) {
 +                revert_at_us_ = 0;
-+                if (ReactionsAllowed(state) && !touching_) SetFace(revert_to_);
++                if (ReactionsAllowed(state) && !touching_) {
++                    // 대기 중이고 오래 혼자였으면 무표정을 거치지 않고 바로 졸린 얼굴로
++                    if (state == kDeviceStateIdle && now - last_activity_us_ > 120LL * 1000 * 1000) {
++                        sleepy_ = true;
++                        SetFace("sleepy");
++                    } else {
++                        SetFace(revert_to_);
++                    }
++                }
 +            }
 +
 +            // 대기 중: 가끔 표정 놀이, 오래 혼자면 졸림
 +            if (state == kDeviceStateIdle && !touching_ && revert_at_us_ == 0 && chained_.empty()) {
-+                if (!sleepy_ && now - state_since_us_ > 120LL * 1000 * 1000) {
++                if (!sleepy_ && now - last_activity_us_ > 120LL * 1000 * 1000) {
 +                    sleepy_ = true;
 +                    SetFace("sleepy");
 +                } else if (!sleepy_ && now >= next_idle_fx_us_) {
@@ -426,6 +437,8 @@ index 0000000..8d06394
 +                long_press_shown_ = true;
 +                SetFace("relaxed");
 +                revert_at_us_ = 0;
++                sleepy_ = false;
++                last_activity_us_ = now;
 +                if (on_activity_) on_activity_();
 +            }
 +        } else if (num == 0 && touching_) {
