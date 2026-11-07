@@ -183,6 +183,336 @@ index b79d033..cd06ad5 100644
  #if CONFIG_USE_DEVICE_AEC
      bool device_aec_enabled_ = true;
  #else
+diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
+new file mode 100644
+index 0000000..aade8f8
+--- /dev/null
++++ b/main/boards/m5stack/stackchan/reactions.h
+@@ -0,0 +1,287 @@
++// direct-cloud: 터치·흔들기 반응과 대기 중 표정 변화
++//
++// - 터치 (FT6336, 0x38): 톡 치기 / 쓰다듬기(길게) / 간지럼(문지르기) / 여러 번 콕콕
++// - 흔들기 (BMI270, 0x69): 세게 흔들면 깜짝 → 어지러움
++// - 대기 중: 가끔 윙크나 편안한 표정, 오래 혼자 두면 졸린 얼굴
++//
++// 50ms마다 센서를 읽는 작은 태스크 하나로 동작한다. 표정 변경은 Application 메인 루프에 맡긴다.
++#pragma once
++
++#include "application.h"
++#include "display.h"
++#include "i2c_device.h"
++
++#include <esp_log.h>
++#include <esp_random.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#include <cmath>
++#include <functional>
++#include <string>
++
++// BMI270 설정 파일 (espressif/bmi270_sensor 부품에 들어 있는 8KB 바이너리)
++extern "C" const uint8_t bmi270_config_file[];
++
++namespace stackchan_reactions {
++
++static const char* const RTAG = "Reactions";
++
++// 터치 칩. 손가락 수와 첫 손가락 좌표만 읽는다.
++class TouchPanel : public I2cDevice {
++public:
++    TouchPanel(i2c_master_bus_handle_t bus, uint8_t addr) : I2cDevice(bus, addr) {}
++    bool Read(int& num, int& x, int& y) {
++        uint8_t buf[5] = {0};
++        ReadRegs(0x02, buf, sizeof(buf));
++        num = buf[0] & 0x0F;
++        x = ((buf[1] & 0x0F) << 8) | buf[2];
++        y = ((buf[3] & 0x0F) << 8) | buf[4];
++        return num <= 2;
++    }
++    uint8_t ChipId() { return ReadReg(0xA3); }
++};
++
++// 가속도만 쓰는 최소 BMI270 드라이버 (설정 파일을 올린 뒤 가속도계만 켠다)
++class Accel : public I2cDevice {
++public:
++    Accel(i2c_master_bus_handle_t bus, uint8_t addr) : I2cDevice(bus, addr) {}
++
++    bool Begin() {
++        if (ReadReg(0x00) != 0x24) {  // CHIP_ID
++            ESP_LOGW(RTAG, "BMI270 not found");
++            return false;
++        }
++        WriteReg(0x7E, 0xB6);  // soft reset
++        vTaskDelay(pdMS_TO_TICKS(5));
++        WriteReg(0x7C, 0x00);  // PWR_CONF: advanced power save off
++        vTaskDelay(pdMS_TO_TICKS(1));
++        WriteReg(0x59, 0x00);  // INIT_CTRL: start config load
++        const size_t kChunk = 64;
++        for (size_t off = 0; off < 8192; off += kChunk) {
++            WriteReg(0x5B, (uint8_t)((off / 2) & 0x0F));  // INIT_ADDR_0
++            WriteReg(0x5C, (uint8_t)((off / 2) >> 4));    // INIT_ADDR_1
++            WriteRegs(0x5E, bmi270_config_file + off, kChunk);  // INIT_DATA
++        }
++        WriteReg(0x59, 0x01);  // INIT_CTRL: done
++        vTaskDelay(pdMS_TO_TICKS(30));
++        uint8_t status = ReadReg(0x21) & 0x0F;  // INTERNAL_STATUS
++        if (status != 0x01) {
++            ESP_LOGW(RTAG, "BMI270 init status 0x%02X", status);
++            return false;
++        }
++        WriteReg(0x7D, 0x04);  // PWR_CTRL: accel on
++        WriteReg(0x40, 0xA8);  // ACC_CONF: 100Hz, normal, performance
++        WriteReg(0x41, 0x01);  // ACC_RANGE: ±4g (8192 LSB/g)
++        vTaskDelay(pdMS_TO_TICKS(10));
++        ESP_LOGI(RTAG, "BMI270 ready");
++        return true;
++    }
++
++    // 단위: g
++    void Read(float& x, float& y, float& z) {
++        uint8_t b[6];
++        ReadRegs(0x0C, b, 6);
++        x = (int16_t)(b[0] | (b[1] << 8)) / 8192.0f;
++        y = (int16_t)(b[2] | (b[3] << 8)) / 8192.0f;
++        z = (int16_t)(b[4] | (b[5] << 8)) / 8192.0f;
++    }
++};
++
++class Reactions {
++public:
++    void Start(i2c_master_bus_handle_t bus, std::function<void()> on_activity) {
++        on_activity_ = std::move(on_activity);
++        touch_ = new TouchPanel(bus, 0x38);
++        ESP_LOGI(RTAG, "Touch chip id 0x%02X", touch_->ChipId());
++        accel_ = new Accel(bus, 0x69);
++        has_accel_ = accel_->Begin();
++        xTaskCreate([](void* arg) { static_cast<Reactions*>(arg)->Loop(); }, "reactions", 4096,
++                    this, 2, nullptr);
++    }
++
++private:
++    TouchPanel* touch_ = nullptr;
++    Accel* accel_ = nullptr;
++    bool has_accel_ = false;
++    std::function<void()> on_activity_;
++
++    // 표정을 잠깐 바꿨다가 되돌리기
++    int64_t revert_at_us_ = 0;
++    std::string revert_to_;
++    std::string chained_;  // 첫 표정 뒤에 이어서 보여 줄 표정 (깜짝 → 어지러움)
++    int64_t chained_at_us_ = 0;
++
++    // 터치 상태
++    bool touching_ = false;
++    int64_t touch_start_us_ = 0;
++    int touch_x0_ = 0, touch_x_min_ = 0, touch_x_max_ = 0;
++    bool long_press_shown_ = false;
++    int64_t tap_times_[4] = {0};
++
++    // 흔들기 상태
++    int shake_hits_ = 0;
++    int64_t shake_window_us_ = 0;
++    int64_t last_shake_us_ = 0;
++
++    // 대기 상태
++    DeviceState last_state_ = kDeviceStateUnknown;
++    int64_t state_since_us_ = 0;
++    int64_t next_idle_fx_us_ = 0;
++    bool sleepy_ = false;
++
++    static int64_t Now() { return esp_timer_get_time(); }
++    static uint32_t Rand(uint32_t n) { return esp_random() % n; }
++
++    static void SetFace(const std::string& emotion) {
++        auto& app = Application::GetInstance();
++        app.Schedule([emotion]() {
++            auto display = Board::GetInstance().GetDisplay();
++            if (display) display->SetEmotion(emotion.c_str());
++        });
++    }
++
++    // 지금 상태에서 돌아갈 기본 얼굴
++    static std::string BaseFace(DeviceState s) {
++        return s == kDeviceStateSpeaking ? "happy" : "neutral";
++    }
++
++    static bool ReactionsAllowed(DeviceState s) {
++        return s == kDeviceStateIdle || s == kDeviceStateListening || s == kDeviceStateSpeaking ||
++               s == kDeviceStateConnecting;
++    }
++
++    void Show(const std::string& face, int ms, DeviceState s) {
++        SetFace(face);
++        revert_to_ = BaseFace(s);
++        revert_at_us_ = Now() + (int64_t)ms * 1000;
++        sleepy_ = false;
++        next_idle_fx_us_ = Now() + 15LL * 1000 * 1000;
++        if (on_activity_) on_activity_();
++    }
++
++    void Loop() {
++        int64_t last_accel_us = 0;
++        while (true) {
++            vTaskDelay(pdMS_TO_TICKS(50));
++            int64_t now = Now();
++            DeviceState state = Application::GetInstance().GetDeviceState();
++            if (state != last_state_) {
++                last_state_ = state;
++                state_since_us_ = now;
++                sleepy_ = false;
++                next_idle_fx_us_ = now + (15 + Rand(20)) * 1000000LL;
++                revert_at_us_ = 0;
++                chained_.clear();
++            }
++            bool allowed = ReactionsAllowed(state);
++
++            PollTouch(now, state, allowed);
++            if (has_accel_ && now - last_accel_us >= 50 * 1000) {
++                last_accel_us = now;
++                PollShake(now, state, allowed);
++            }
++
++            // 이어지는 표정 / 원래 얼굴로 되돌리기
++            if (!chained_.empty() && now >= chained_at_us_) {
++                SetFace(chained_);
++                chained_.clear();
++            } else if (revert_at_us_ && now >= revert_at_us_ && chained_.empty()) {
++                revert_at_us_ = 0;
++                if (ReactionsAllowed(state) && !touching_) SetFace(revert_to_);
++            }
++
++            // 대기 중: 가끔 표정 놀이, 오래 혼자면 졸림
++            if (state == kDeviceStateIdle && !touching_ && revert_at_us_ == 0 && chained_.empty()) {
++                if (!sleepy_ && now - state_since_us_ > 120LL * 1000 * 1000) {
++                    sleepy_ = true;
++                    SetFace("sleepy");
++                } else if (!sleepy_ && now >= next_idle_fx_us_) {
++                    static const char* kIdleFx[] = {"winking", "relaxed", "idle", "happy", "silly"};
++                    SetFace(kIdleFx[Rand(5)]);
++                    revert_to_ = "neutral";
++                    revert_at_us_ = now + (1200 + Rand(1500)) * 1000LL;
++                    next_idle_fx_us_ = now + (20 + Rand(25)) * 1000000LL;
++                }
++            }
++        }
++    }
++
++    void PollTouch(int64_t now, DeviceState state, bool allowed) {
++        int num = 0, x = 0, y = 0;
++        if (!touch_->Read(num, x, y)) return;
++        if (num > 0 && !touching_) {
++            touching_ = true;
++            touch_start_us_ = now;
++            touch_x0_ = touch_x_min_ = touch_x_max_ = x;
++            long_press_shown_ = false;
++        } else if (num > 0 && touching_) {
++            if (x < touch_x_min_) touch_x_min_ = x;
++            if (x > touch_x_max_) touch_x_max_ = x;
++            // 좌우로 문지르면 간지럼
++            if (allowed && !long_press_shown_ && touch_x_max_ - touch_x_min_ > 120) {
++                long_press_shown_ = true;
++                Show("laughing", 2500, state);
++            }
++            // 가만히 오래 대고 있으면 쓰다듬기
++            if (allowed && !long_press_shown_ && now - touch_start_us_ > 800 * 1000) {
++                long_press_shown_ = true;
++                SetFace("relaxed");
++                revert_at_us_ = 0;
++                if (on_activity_) on_activity_();
++            }
++        } else if (num == 0 && touching_) {
++            touching_ = false;
++            int64_t held = now - touch_start_us_;
++            if (!allowed) return;
++            if (long_press_shown_) {
++                // 쓰다듬기가 끝나면 좋아하는 얼굴
++                if (held > 800 * 1000 && touch_x_max_ - touch_x_min_ <= 120) Show("loving", 2500, state);
++                else if (revert_at_us_ == 0) Show("happy", 1500, state);
++                return;
++            }
++            // 짧게 톡: 최근 1.5초 안에 여러 번이면 콕콕 찌르기
++            for (int i = 3; i > 0; i--) tap_times_[i] = tap_times_[i - 1];
++            tap_times_[0] = now;
++            int recent = 0;
++            for (auto t : tap_times_) if (t && now - t < 1500 * 1000) recent++;
++            if (recent >= 4) {
++                Show("angry", 1500, state);
++                chained_ = "embarrassed";
++                chained_at_us_ = now + 1500 * 1000;
++                revert_at_us_ = now + 3200 * 1000;
++                tap_times_[1] = tap_times_[2] = tap_times_[3] = 0;
++            } else if (recent >= 2) {
++                Show(Rand(2) ? "surprised" : "embarrassed", 1500, state);
++            } else {
++                static const char* kTap[] = {"happy", "winking", "loving", "funny"};
++                Show(kTap[Rand(4)], 1500, state);
++            }
++        }
++    }
++
++    void PollShake(int64_t now, DeviceState state, bool allowed) {
++        float ax, ay, az;
++        accel_->Read(ax, ay, az);
++        float mag = std::sqrt(ax * ax + ay * ay + az * az);
++        float dev = std::fabs(mag - 1.0f);  // 가만히 있으면 1g
++        if (now - shake_window_us_ > 800 * 1000) {
++            shake_window_us_ = now;
++            shake_hits_ = 0;
++        }
++        if (dev > 0.7f) shake_hits_++;
++        if (shake_hits_ >= 3 && allowed && now - last_shake_us_ > 3 * 1000 * 1000) {
++            last_shake_us_ = now;
++            shake_hits_ = 0;
++            ESP_LOGI(RTAG, "Shake detected (%.2fg)", mag);
++            // 깜짝 → 어지러움(헷갈리는 얼굴) → 원래대로
++            Show("shocked", 1200, state);
++            chained_ = "confused";
++            chained_at_us_ = now + 1200 * 1000;
++            revert_at_us_ = now + 3500 * 1000;
++        }
++    }
++};
++
++}  // namespace stackchan_reactions
+diff --git a/main/boards/m5stack/stackchan/stackchan.cc b/main/boards/m5stack/stackchan/stackchan.cc
+index b25e414..7ce7ec9 100644
+--- a/main/boards/m5stack/stackchan/stackchan.cc
++++ b/main/boards/m5stack/stackchan/stackchan.cc
+@@ -19,6 +19,9 @@
+ #include "feetech_scs.h"   // the MIT SCS bus driver
+ #include "mcp_server.h"    // the device-side tool surface
+ #include <atomic>          // the power-save pin, written by tool calls and read on app tasks
++#if CONFIG_DIRECT_CLOUD_MODE
++#include "reactions.h"      // direct-cloud: 터치·흔들기 반응, 대기 표정
++#endif
+ 
+ #define TAG "StackChanBoard"
+ 
+@@ -603,6 +606,9 @@ private:
+ class StackChanBoard : public WifiBoard {
+ private:
+     i2c_master_bus_handle_t i2c_bus_;
++#if CONFIG_DIRECT_CLOUD_MODE
++    stackchan_reactions::Reactions reactions_;
++#endif
+     Pmic* pmic_;
+     Aw9523* aw9523_;
+     // The PY32 on the StackChan base. Null when it did not answer; the board still boots,
+@@ -1172,6 +1178,12 @@ public:
+         InitializePy32();
+         InitializeServoNeck();
+         GetBacklight()->RestoreBrightness();
++#if CONFIG_DIRECT_CLOUD_MODE
++        // 만지거나 흔들면 화면이 다시 밝아지도록 절전 타이머도 깨운다
++        reactions_.Start(i2c_bus_, [this]() {
++            if (power_save_timer_) power_save_timer_->WakeUp();
++        });
++#endif
+     }
+ 
+     // Was NoLed from the base class until now, so every OnStateChanged() upstream makes went
 diff --git a/main/idf_component.yml b/main/idf_component.yml
 index c9c64ec..91d140a 100644
 --- a/main/idf_component.yml
@@ -209,10 +539,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..2edea99
+index 0000000..e323730
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,1260 @@
+@@ -0,0 +1,1303 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -275,9 +605,13 @@ index 0000000..2edea99
 +    "예: 밤 열두 시 십오 분, 십일월 칠일 토요일, 사과 세 개.\n"
 +    "모르는 건 모른다고 솔직하게 말해. 날씨나 뉴스처럼 실시간 정보는 알 수 없다고 말해.\n"
 +    "대답 맨 앞에는 반드시 지금 감정을 대괄호 태그 하나로 붙여. 예: [happy] 안녕!\n"
-+    "쓸 수 있는 감정: happy, laughing, funny, loving, embarrassed, confident, delicious, "
-+    "sad, crying, sleepy, silly, angry, surprised, shocked, thinking, winking, relaxed, "
-+    "confused, neutral";
++    "대답 중간에 기분이 바뀌면 그 문장 앞에 태그를 하나 더 붙여도 돼. 예: [surprised] 우와! [laughing] 진짜 웃기다!\n"
++    "표정은 상황에 맞게 골고루 써. 같은 표정만 반복하지 마.\n"
++    "happy 기쁨, 반가움 / laughing 크게 웃김 / funny 장난스러움 / loving 고마움, 사랑, 칭찬 / "
++    "embarrassed 쑥스러움, 칭찬받음 / confident 자신 있게 알려줄 때 / delicious 음식 이야기 / "
++    "sad 슬픔, 아쉬움 / crying 아주 슬픔 / sleepy 졸림, 밤 / silly 엉뚱함 / angry 화남(장난스럽게만) / "
++    "surprised 놀람, 신기함 / shocked 깜짝 놀람 / thinking 생각하거나 퀴즈 낼 때 / winking 비밀, 장난 / "
++    "relaxed 편안함, 쉬기 / confused 말을 정말 못 알아들었을 때만 / neutral 평범할 때";
 +
 +// 지금 날짜와 시각을 한국어로 (시계가 아직 안 맞았으면 빈 문자열)
 +std::string CurrentTimeText() {
@@ -345,6 +679,25 @@ index 0000000..2edea99
 +        if (first && c == ',' && i >= 24) return i + 1;
 +    }
 +    return std::string::npos;
++}
++
++bool IsKnownEmotion(const std::string& e);
++
++// "[happy]" 같은 감정 태그를 모두 지우고, 처음 나온 알려진 감정을 돌려준다
++std::string StripEmotionTags(std::string& text) {
++    std::string first;
++    size_t pos = 0;
++    while ((pos = text.find('[', pos)) != std::string::npos) {
++        size_t close = text.find(']', pos);
++        if (close == std::string::npos || close - pos > 20) {
++            pos++;
++            continue;
++        }
++        std::string tag = text.substr(pos + 1, close - pos - 1);
++        if (first.empty() && IsKnownEmotion(tag)) first = tag;
++        text.erase(pos, close - pos + 1);
++    }
++    return first;
 +}
 +
 +std::string Trim(const std::string& s) {
@@ -581,6 +934,7 @@ index 0000000..2edea99
 +    }
 +    ESP_LOGI(TAG, "LAT open_channel=%lld ms", (esp_timer_get_time() - t0) / 1000);
 +    channel_open_ = true;
++    greet_on_listen_ = true;
 +    if (on_audio_channel_opened_) on_audio_channel_opened_();
 +    // 대화가 시작됐으니 답변·음성 합성 연결도 살아 있는지 확인해 둔다
 +    {
@@ -703,6 +1057,9 @@ index 0000000..2edea99
 +        up_queued_ms_ = 0;
 +    }
 +    listening_ = true;
++    if (greet_on_listen_.exchange(false)) {
++        EmitJson("llm", "emotion", "happy");  // 깨우면 반가운 얼굴로 듣기 시작
++    }
 +}
 +
 +void DirectProtocol::SendStopListening() {
@@ -845,6 +1202,7 @@ index 0000000..2edea99
 +        return;
 +    }
 +    EmitJson("stt", "text", text.c_str());
++    EmitJson("llm", "emotion", "thinking");  // 대답을 기다리는 동안 생각하는 얼굴
 +
 +    // 어른용 음성 명령: "설정 모드" → 설정 화면(Xiaozhi-XXXX, 192.168.4.1)으로
 +    {
@@ -1031,11 +1389,16 @@ index 0000000..2edea99
 +    char buf[512];
 +    bool done = false;
 +
++    std::string first_emotion;
 +    auto push_sentence = [&](const std::string& raw, bool last) {
-+        std::string s = CleanForSpeech(raw);
++        std::string text = raw;
++        std::string emotion = StripEmotionTags(text);
++        if (emotion.empty() && !first_emotion.empty()) emotion = first_emotion;
++        first_emotion.clear();
++        std::string s = CleanForSpeech(text);
 +        if (s.empty() && !last) return;
 +        std::lock_guard<std::mutex> lock(mutex_);
-+        tts_jobs_.push_back({turn, s, last});
++        tts_jobs_.push_back({turn, s, last, emotion});
 +        cv_.notify_all();
 +    };
 +
@@ -1086,7 +1449,7 @@ index 0000000..2edea99
 +                        emotion_done = true;
 +                    } else {
 +                        std::string emo = t.substr(1, close - 1);
-+                        if (IsKnownEmotion(emo)) EmitJson("llm", "emotion", emo.c_str());
++                        if (IsKnownEmotion(emo)) first_emotion = emo;  // 첫 문장을 말하기 시작할 때 바꾼다
 +                        text_buf = t.substr(close + 1);
 +                        emotion_done = true;
 +                    }
@@ -1100,7 +1463,11 @@ index 0000000..2edea99
 +                std::string sentence = text_buf.substr(0, end);
 +                text_buf.erase(0, end);
 +                if (Trim(sentence).empty()) continue;
-+                full_reply += sentence;
++                {
++                    std::string plain = sentence;
++                    StripEmotionTags(plain);
++                    full_reply += plain;
++                }
 +                push_sentence(sentence, false);
 +                first_sentence = false;
 +            }
@@ -1297,7 +1664,7 @@ index 0000000..2edea99
 +            continue;
 +        }
 +        if (!IsCurrent(job.turn)) continue;
-+        if (job.text.empty() || !Synthesize(job.turn, job.text, job.last)) {
++        if (job.text.empty() || !Synthesize(job.turn, job.text, job.last, job.emotion)) {
 +            if (job.last) {
 +                // 마지막 표시만 넘겨서 재생 쪽이 턴을 끝낼 수 있게 한다
 +                std::lock_guard<std::mutex> lock(mutex_);
@@ -1311,7 +1678,8 @@ index 0000000..2edea99
 +    }
 +}
 +
-+bool DirectProtocol::Synthesize(uint32_t turn, const std::string& text, bool last) {
++bool DirectProtocol::Synthesize(uint32_t turn, const std::string& text, bool last,
++                                const std::string& emotion) {
 +    int64_t t0 = esp_timer_get_time();
 +    auto network = Board::GetInstance().GetNetwork();
 +    if (!tts_http_) {
@@ -1408,6 +1776,7 @@ index 0000000..2edea99
 +             (unsigned)chunk.frames.size(), (unsigned)text.size());
 +    if (chunk.frames.empty()) return false;
 +    chunk.last = last;
++    chunk.emotion = emotion;
 +
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    if (!IsCurrent(turn)) return true;
@@ -1443,6 +1812,10 @@ index 0000000..2edea99
 +            play_start_us = esp_timer_get_time();
 +            queued_us = 0;
 +        }
++        if (!c.emotion.empty() && IsCurrent(c.turn)) {
++            // 이 문장을 말하기 시작할 때 표정을 바꾼다
++            EmitJson("llm", "emotion", c.emotion.c_str());
++        }
 +
 +        for (auto& f : c.frames) {
 +            if (!IsCurrent(c.turn)) break;
@@ -1475,10 +1848,10 @@ index 0000000..2edea99
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..9ba35f9
+index 0000000..a57a64c
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,157 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1533,6 +1906,7 @@ index 0000000..9ba35f9
 +        uint32_t turn;
 +        std::string text;
 +        bool last;
++        std::string emotion;  // 이 문장을 말하기 시작할 때 바꿀 표정 (없으면 그대로)
 +    };
 +    // 한 문장 분량의 음성. 프레임 수백 개를 따로 할당하면 내부 RAM이 바닥나므로
 +    // 큰 버퍼 하나(PSRAM으로 감)에 이어 붙이고 위치만 따로 둔다.
@@ -1547,6 +1921,7 @@ index 0000000..9ba35f9
 +        std::vector<uint8_t> data;
 +        std::vector<Frame> frames;
 +        bool last = false;
++        std::string emotion;
 +    };
 +
 +    DirectConfig config_;
@@ -1562,6 +1937,7 @@ index 0000000..9ba35f9
 +    std::mutex asr_mutex_;
 +    std::mutex ws_mutex_;
 +    std::atomic<bool> channel_open_{false};
++    std::atomic<bool> greet_on_listen_{false};
 +    esp_timer_handle_t vad_timer_ = nullptr;
 +    int64_t listen_start_us_ = 0;
 +    int64_t last_voice_us_ = 0;
@@ -1623,7 +1999,7 @@ index 0000000..9ba35f9
 +    void TtsLoop();
 +    void PlayerLoop();
 +    void RunLlm(uint32_t turn, const std::string& user_text);
-+    bool Synthesize(uint32_t turn, const std::string& text, bool last);
++    bool Synthesize(uint32_t turn, const std::string& text, bool last, const std::string& emotion = "");
 +    bool IsCurrent(uint32_t turn) const { return turn == turn_.load(); }
 +    std::string BuildLlmBody(const std::string& user_text);
 +    bool EnsureOpusDecoder();
