@@ -53,7 +53,13 @@
 - 코드: `firmware/patches/03-direct-cloud.patch`(DirectProtocol, Kconfig `DIRECT_CLOUD_MODE`), `04-wifi-connect-api-keys.patch`(설정 화면 고급 탭에 키 3개)
 - 빌드: `bash firmware/build.sh direct`
 - 사용·측정: `docs/DIRECT.md`
-- 상태: 빌드 성공. 기기 테스트 전. 미확인 항목은 `docs/DIRECT.md` 끝에 정리
+- 상태(2026-11-07): 기기에서 정상 동작. 사용자 평가 "훨씬 좋아졌다"
+  - 측정(커밋 8fd94e4): 말 끝→첫 음성 3.0~3.35초 / 말 끝→인식 1.0~1.16초 / DeepSeek 첫 글자 0.82~0.89초 / Chirp 3 HD 첫 문장 0.95~1.1초
+  - 업로드: `UP audio≈wall` 로 실시간 유지 (TCP 송신 버퍼 16KB 효과)
+  - 그동안 고친 것: 통신 모듈 MQTT 덮어쓰기 버그, 에셋 미적용, 스레드 우선순위, 내부 RAM 고갈(TTS 음성 PSRAM 버퍼),
+    Google keep-alive(HTTP/1.1 기본값), DeepSeek 추론 끄기(thinking disabled), 원음(PCM) 업로드, 말 끝 판정 1.0초/endpointing 800ms
+  - 다음 후보: 첫 문장을 더 짧게 끊어 TTS 시작 앞당기기, 말 끝 판정 0.7~0.8초 시험, Chirp vs WaveNet 속도/음질 선택
+  - 참고: NAS 서버도 같은 deepseek-flash라 추론 끄기를 서버에 적용하면 서버 방식도 1초 이상 빨라질 가능성
 
 ## 측정 도구 (2026-11-05 추가, 서버 로그용)
 
