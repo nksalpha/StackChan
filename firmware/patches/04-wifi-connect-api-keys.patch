@@ -1,7 +1,7 @@
 diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b/assets/wifi_configuration.html
 --- a/assets/wifi_configuration.html	2026-11-06 01:04:26.391156182 +0000
-+++ b/assets/wifi_configuration.html	2026-11-07 13:07:58.375306194 +0000
-@@ -534,9 +534,26 @@
++++ b/assets/wifi_configuration.html	2026-11-07 15:22:58.795332206 +0000
+@@ -534,9 +534,29 @@
                      <label for="password" data-lang="password">Password:</label>
                      <input type="password" id="password" name="password">
                  </p>
@@ -17,21 +17,26 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    <label for="tts_voice">TTS 음성 이름</label>
 +                    <input type="text" id="tts_voice" name="tts_voice" placeholder="ko-KR-Chirp3-HD-Achernar" autocomplete="off" autocapitalize="off" spellcheck="false">
 +                    <p style="font-size: 12px; opacity: 0.7;">예: ko-KR-Chirp3-HD-Achernar, ko-KR-Chirp3-HD-Leda, ko-KR-Chirp3-HD-Kore, ko-KR-Wavenet-A. 비워 두면 ko-KR-Chirp3-HD-Achernar.</p>
++                    <label for="memory">아이 정보 / 기억 메모</label>
++                    <textarea id="memory" name="memory" rows="6" style="width: 100%; box-sizing: border-box;" placeholder="- 이름은 서연, 여섯 살&#10;- 공룡과 그림 그리기를 좋아함" oninput="memoryDirty = true"></textarea>
++                    <p style="font-size: 12px; opacity: 0.7;">스택짱이 대화하면서 스스로 고쳐 나갑니다. 틀린 내용은 여기서 고치거나 지우면 됩니다. 모두 지우고 저장하면 기억이 초기화됩니다.</p>
 +                </div>
 +
                  <p>
                      <input type="submit" value="Connect" id="button" data-lang-value="connect">
                  </p>
 +                <p>
-+                    <button type="button" id="keys_only_button" onclick="saveKeysOnly()" style="width: 100%;">API 키만 저장</button>
++                    <button type="button" id="keys_only_button" onclick="saveKeysOnly()" style="width: 100%;">API 키·메모만 저장</button>
 +                </p>
              </form>
              <div id="ap_list"></div>
          </div>
-@@ -1606,6 +1623,30 @@
+@@ -1606,6 +1626,34 @@
          /**
           * Submit Wi-Fi connection form
           */
++        let memoryDirty = false;  // direct-cloud: 메모를 고친 경우에만 보낸다
++
 +        // direct-cloud: Wi-Fi는 그대로 두고 키만 저장
 +        async function saveKeysOnly() {
 +            const keys = {};
@@ -39,7 +44,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                const v = document.getElementById(k).value.trim();
 +                if (v) keys[k] = v;
 +            }
-+            if (Object.keys(keys).length === 0) { showToast('입력된 키가 없어요'); return; }
++            if (memoryDirty) keys.memory = document.getElementById('memory').value.trim();
++            if (Object.keys(keys).length === 0) { showToast('바뀐 내용이 없어요'); return; }
 +            try {
 +                const r = await fetch('/advanced/submit', {
 +                    method: 'POST',
@@ -50,7 +56,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                if (!d.success) throw new Error();
 +                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key']) document.getElementById(k).value = '';
 +                loadAdvancedConfig();
-+                showToast('API 키를 저장했어요');
++                memoryDirty = false;
++                showToast('저장했어요');
 +            } catch (e) {
 +                showToast('API 키 저장 실패');
 +            }
@@ -59,7 +66,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
          async function submitForm(event) {
              event.preventDefault();
              button.disabled = true;
-@@ -1621,6 +1662,21 @@
+@@ -1621,6 +1669,22 @@
              };
  
              try {
@@ -69,6 +76,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    const v = document.getElementById(k).value.trim();
 +                    if (v) keys[k] = v;
 +                }
++                if (memoryDirty) keys.memory = document.getElementById('memory').value.trim();
 +                if (Object.keys(keys).length > 0) {
 +                    const kr = await fetch('/advanced/submit', {
 +                        method: 'POST',
@@ -81,7 +89,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
                  const response = await fetch('/submit', {
                      method: 'POST',
                      headers: {
-@@ -1749,6 +1805,11 @@
+@@ -1749,6 +1813,12 @@
                  if (data.sleep_mode !== undefined) {
                      document.getElementById('sleep_mode').checked = data.sleep_mode;
                  }
@@ -90,12 +98,13 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    if (el) el.textContent = data[k + '_set'] ? '(저장됨)' : '(없음)';
 +                }
 +                if (data.tts_voice) document.getElementById('tts_voice').value = data.tts_voice;
++                if (!memoryDirty) document.getElementById('memory').value = data.memory || '';
              } catch (error) {
                  console.error('Error loading advanced config:', error);
              }
 diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_configuration_ap.cc
 --- a/wifi_configuration_ap.cc	2026-11-06 01:04:26.388940730 +0000
-+++ b/wifi_configuration_ap.cc	2026-11-06 10:45:19.177289011 +0000
++++ b/wifi_configuration_ap.cc	2026-11-07 15:22:44.714696406 +0000
 @@ -1,5 +1,7 @@
  #include "wifi_configuration_ap.h"
  #include <cstdio>
@@ -104,7 +113,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
  #include <memory>
  #include <freertos/FreeRTOS.h>
  #include <freertos/event_groups.h>
-@@ -533,6 +535,28 @@
+@@ -533,6 +535,36 @@
              cJSON_AddBoolToObject(json, "show_ota_config", this_->show_ota_config_);
              cJSON_AddBoolToObject(json, "show_sleep_config", this_->show_sleep_config_);
  
@@ -126,6 +135,14 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
 +                    if (nvs_get_str(dnvs, "tts_voice", voice, &vlen) == ESP_OK) {
 +                        cJSON_AddStringToObject(json, "tts_voice", voice);
 +                    }
++                    size_t mlen = 0;
++                    if (nvs_get_str(dnvs, "memory", nullptr, &mlen) == ESP_OK && mlen > 1) {
++                        std::string mem(mlen, '\0');
++                        if (nvs_get_str(dnvs, "memory", mem.data(), &mlen) == ESP_OK) {
++                            mem.resize(strlen(mem.c_str()));
++                            cJSON_AddStringToObject(json, "memory", mem.c_str());
++                        }
++                    }
 +                    nvs_close(dnvs);
 +                }
 +            }
@@ -133,7 +150,16 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
              // 发送JSON响应
              char *json_str = cJSON_PrintUnformatted(json);
              cJSON_Delete(json);
-@@ -601,6 +625,30 @@
+@@ -558,7 +590,7 @@
+         .handler = [](httpd_req_t *req) -> esp_err_t {
+             char *buf;
+             size_t buf_len = req->content_len;
+-            if (buf_len > 1024) {
++            if (buf_len > 6144) {  // direct-cloud: 기억 메모(최대 약 2.4KB)까지 받는다
+                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+                 return ESP_FAIL;
+             }
+@@ -601,6 +633,41 @@
                  return ESP_FAIL;
              }
  
@@ -154,6 +180,17 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
 +                            if (!val.empty() && nvs_set_str(dnvs, f[1], val.c_str()) != ESP_OK) {
 +                                ESP_LOGE(TAG, "Failed to save %s", f[1]);
 +                            }
++                        }
++                    }
++                    // 기억 메모: 화면에서 고친 경우에만 온다. 빈 문자열이면 지운다
++                    cJSON* mem = cJSON_GetObjectItem(json, "memory");
++                    if (cJSON_IsString(mem) && mem->valuestring) {
++                        if (mem->valuestring[0]) {
++                            std::string m = mem->valuestring;
++                            if (m.size() > 3000) m.resize(3000);
++                            nvs_set_str(dnvs, "memory", m.c_str());
++                        } else {
++                            nvs_erase_key(dnvs, "memory");
 +                        }
 +                    }
 +                    nvs_commit(dnvs);

@@ -209,10 +209,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..b0b18dc
+index 0000000..2a4370a
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1172 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -228,6 +228,7 @@ index 0000000..b0b18dc
 +#include "audio_service.h"
 +#include "board.h"
 +#include "settings.h"
++#include "wifi_board.h"
 +
 +#include <cJSON.h>
 +#include <esp_heap_caps.h>
@@ -372,6 +373,7 @@ index 0000000..b0b18dc
 +    c.google_tts_key = s.GetString("gtts_key");
 +    c.llm_model = s.GetString("llm_model", CONFIG_DIRECT_LLM_MODEL);
 +    c.tts_voice = s.GetString("tts_voice", CONFIG_DIRECT_TTS_VOICE);
++    c.memory = s.GetString("memory");
 +    return c;
 +}
 +
@@ -389,6 +391,7 @@ index 0000000..b0b18dc
 +    if (llm_thread_.joinable()) llm_thread_.join();
 +    if (tts_thread_.joinable()) tts_thread_.join();
 +    if (player_thread_.joinable()) player_thread_.join();
++    if (memory_thread_.joinable()) memory_thread_.join();
 +    if (keepalive_timer_) {
 +        esp_timer_stop(keepalive_timer_);
 +        esp_timer_delete(keepalive_timer_);
@@ -418,6 +421,11 @@ index 0000000..b0b18dc
 +        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
 +        esp_netif_sntp_init(&sntp_cfg);
 +    }
++    {
++        std::lock_guard<std::mutex> lock(memory_mutex_);
++        memory_ = config_.memory;
++    }
++    ESP_LOGI(TAG, "Memory: %u bytes", (unsigned)config_.memory.size());
 +    ESP_LOGI(TAG, "Direct mode: llm=%s voice=%s", config_.llm_model.c_str(),
 +             config_.tts_voice.c_str());
 +
@@ -437,6 +445,12 @@ index 0000000..b0b18dc
 +    cfg.thread_name = "direct_play";
 +    esp_pthread_set_cfg(&cfg);
 +    player_thread_ = std::thread([this]() { PlayerLoop(); });
++    cfg.stack_size = 8 * 1024;
++    cfg.prio = 1;
++    cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
++    cfg.thread_name = "direct_mem";
++    esp_pthread_set_cfg(&cfg);
++    memory_thread_ = std::thread([this]() { MemoryLoop(); });
 +    auto def = esp_pthread_get_default_config();
 +    esp_pthread_set_cfg(&def);
 +
@@ -562,6 +576,7 @@ index 0000000..b0b18dc
 +void DirectProtocol::CloseAudioChannel(bool send_goodbye) {
 +    // Deepgram 연결은 KeepAlive로 잠시 유지해서 다음에 깨울 때 바로 듣게 한다
 +    listening_ = false;
++    RequestMemoryUpdate();
 +    if (channel_open_.exchange(false) && on_audio_channel_closed_) on_audio_channel_closed_();
 +}
 +
@@ -703,6 +718,7 @@ index 0000000..b0b18dc
 +        if (idle) {
 +            ESP_LOGI(TAG, "No speech for %lld s, back to idle", kIdleListenUs / 1000000);
 +            listening_ = false;
++            RequestMemoryUpdate();
 +            if (channel_open_.exchange(false) && on_audio_channel_closed_) on_audio_channel_closed_();
 +            return;
 +        }
@@ -746,6 +762,20 @@ index 0000000..b0b18dc
 +    }
 +    EmitJson("stt", "text", text.c_str());
 +
++    // 어른용 음성 명령: "설정 모드" → 설정 화면(Xiaozhi-XXXX, 192.168.4.1)으로
++    {
++        std::string compact;
++        for (char ch : text) if (ch != ' ') compact.push_back(ch);
++        if (compact.find("설정모드") != std::string::npos) {
++            ESP_LOGI(TAG, "Voice command: enter config mode");
++            RequestMemoryUpdate();
++            Application::GetInstance().Schedule([]() {
++                static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode();
++            });
++            return;
++        }
++    }
++
 +    uint32_t turn = turn_.fetch_add(1) + 1;
 +    {
 +        std::lock_guard<std::mutex> lock(mutex_);
@@ -779,6 +809,13 @@ index 0000000..b0b18dc
 +            sys += "\n지금은 한국 시간으로 " + now + "이야. 날짜, 요일, 시간을 물으면 이걸 보고 대답해.";
 +        } else {
 +            sys += "\n지금 시각은 아직 알 수 없어. 시간을 물으면 시계를 맞추는 중이라고 말해.";
++        }
++        {
++            std::lock_guard<std::mutex> lock(memory_mutex_);
++            if (!memory_.empty()) {
++                sys += "\n\n[이 아이에 대해 기억하고 있는 것]\n" + memory_ +
++                       "\n이걸 자연스럽게 활용해서 맞춤으로 대답해. 기억을 줄줄이 읽어 주지는 마.";
++            }
 +        }
 +        add("system", sys);
 +    }
@@ -1001,6 +1038,129 @@ index 0000000..b0b18dc
 +        history_.emplace_back(user_text, reply);
 +        while (history_.size() > kHistoryTurns) history_.pop_front();
 +    }
++    if (!reply.empty()) {
++        std::lock_guard<std::mutex> lock(memory_mutex_);
++        session_log_.push_back("아이: " + user_text);
++        session_log_.push_back("스택짱: " + reply);
++        while (session_log_.size() > 40) session_log_.erase(session_log_.begin());
++    }
++}
++
++void DirectProtocol::RequestMemoryUpdate() {
++    {
++        std::lock_guard<std::mutex> lock(memory_mutex_);
++        if (session_log_.empty()) return;
++        memory_update_pending_ = true;
++    }
++    { std::lock_guard<std::mutex> lock(mutex_); }  // 대기 직전의 MemoryLoop가 알림을 놓치지 않게
++    cv_.notify_all();
++}
++
++void DirectProtocol::MemoryLoop() {
++    while (true) {
++        std::string dialog;
++        {
++            std::unique_lock<std::mutex> lock(mutex_);
++            cv_.wait(lock, [this]() {
++                std::lock_guard<std::mutex> l2(memory_mutex_);
++                return stop_ || memory_update_pending_;
++            });
++            if (stop_) return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(memory_mutex_);
++            memory_update_pending_ = false;
++            for (auto& line : session_log_) dialog += line + "\n";
++            session_log_.clear();
++        }
++        if (!dialog.empty()) UpdateMemory(dialog);
++    }
++}
++
++void DirectProtocol::UpdateMemory(const std::string& dialog) {
++    int64_t t0 = esp_timer_get_time();
++    std::string old_memory;
++    {
++        std::lock_guard<std::mutex> lock(memory_mutex_);
++        old_memory = memory_;
++    }
++    std::string now = CurrentTimeText();
++
++    cJSON* root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "model", config_.llm_model.c_str());
++    cJSON_AddBoolToObject(root, "stream", false);
++    cJSON_AddNumberToObject(root, "max_tokens", 700);
++    if (thinking_param_ok_) {
++        cJSON* thinking = cJSON_AddObjectToObject(root, "thinking");
++        cJSON_AddStringToObject(thinking, "type", "disabled");
++    }
++    cJSON* msgs = cJSON_AddArrayToObject(root, "messages");
++    auto add = [msgs](const char* role, const std::string& content) {
++        cJSON* m = cJSON_CreateObject();
++        cJSON_AddStringToObject(m, "role", role);
++        cJSON_AddStringToObject(m, "content", content.c_str());
++        cJSON_AddItemToArray(msgs, m);
++    };
++    add("system",
++        "너는 어린아이와 대화하는 로봇 스택짱의 기억을 정리하는 비서야.\n"
++        "기존 메모와 방금 나눈 대화를 보고, 앞으로 이 아이와 대화할 때 도움이 될 내용만 남겨 새 메모를 써.\n"
++        "담을 것: 이름, 나이, 좋아하는 것과 싫어하는 것, 가족과 친구, 최근 있었던 일(날짜와 함께), 아이와 한 약속.\n"
++        "확실하지 않은 추측은 쓰지 마. 오래되었거나 사소한 건 지워. 기존 메모의 내용과 다르면 최신 대화를 따라.\n"
++        "한국어로 '- '로 시작하는 짧은 줄들로, 전체 600자 이내로 써. 메모 내용만 출력해. 남길 게 없으면 기존 메모를 그대로 출력해.");
++    std::string user = "오늘: " + (now.empty() ? std::string("알 수 없음") : now) +
++                       "\n\n[기존 메모]\n" + (old_memory.empty() ? std::string("(없음)") : old_memory) +
++                       "\n\n[방금 나눈 대화]\n" + dialog;
++    add("user", user);
++    char* js = cJSON_PrintUnformatted(root);
++    std::string body = js ? js : "";
++    if (js) cJSON_free(js);
++    cJSON_Delete(root);
++
++    auto network = Board::GetInstance().GetNetwork();
++    if (!memory_http_) {
++        memory_http_ = network->CreateHttp(4);
++        memory_http_->SetKeepAlive(false);
++    }
++    auto& http = memory_http_;
++    http->SetTimeout(20000);
++    http->SetHeader("Authorization", "Bearer " + config_.deepseek_key);
++    http->SetHeader("Content-Type", "application/json");
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", kDeepseekUrl)) {
++        ESP_LOGW(TAG, "Memory update: open failed");
++        http->Close();
++        return;
++    }
++    auto status = http->GetStatusCode();
++    std::string resp = http->ReadAll();
++    http->Close();
++    if (!status || *status != 200) {
++        ESP_LOGW(TAG, "Memory update: status %d %.160s", status ? *status : -1, resp.c_str());
++        return;
++    }
++    cJSON* j = cJSON_Parse(resp.c_str());
++    auto choices = j ? cJSON_GetObjectItem(j, "choices") : nullptr;
++    auto c0 = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
++    auto msg = c0 ? cJSON_GetObjectItem(c0, "message") : nullptr;
++    auto content = msg ? cJSON_GetObjectItem(msg, "content") : nullptr;
++    std::string memo = cJSON_IsString(content) ? Trim(content->valuestring) : "";
++    if (j) cJSON_Delete(j);
++    if (memo.empty()) return;
++    // NVS 문자열 한도(4000바이트) 안으로. UTF-8 글자 중간에서 자르지 않는다
++    const size_t kMaxBytes = 2400;
++    if (memo.size() > kMaxBytes) {
++        size_t cut = kMaxBytes;
++        while (cut > 0 && ((unsigned char)memo[cut] & 0xC0) == 0x80) cut--;
++        memo.resize(cut);
++    }
++    {
++        std::lock_guard<std::mutex> lock(memory_mutex_);
++        memory_ = memo;
++    }
++    Settings settings("direct", true);
++    settings.SetString("memory", memo);
++    ESP_LOGI(TAG, "Memory updated in %lld ms (%u bytes):\n%s", (esp_timer_get_time() - t0) / 1000,
++             (unsigned)memo.size(), memo.c_str());
 +}
 +
 +void DirectProtocol::TtsLoop() {
@@ -1227,10 +1387,10 @@ index 0000000..b0b18dc
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..b995fe9
+index 0000000..92568b8
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,141 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1257,6 +1417,7 @@ index 0000000..b995fe9
 +    std::string google_tts_key;
 +    std::string llm_model;
 +    std::string tts_voice;
++    std::string memory;  // 아이에 대한 기억 메모 (NVS "memory")
 +    bool IsComplete() const {
 +        return !deepgram_key.empty() && !deepseek_key.empty() && !google_tts_key.empty();
 +    }
@@ -1334,7 +1495,17 @@ index 0000000..b995fe9
 +    std::deque<Sentence> tts_jobs_;
 +    std::deque<Chunk> chunks_;
 +    bool stop_ = false;
-+    std::thread llm_thread_, tts_thread_, player_thread_;
++    std::thread llm_thread_, tts_thread_, player_thread_, memory_thread_;
++
++    // 기억 메모: 대화 중에는 읽기만, 대화가 끝나면 뒤에서 갱신
++    std::mutex memory_mutex_;
++    std::string memory_;
++    std::vector<std::string> session_log_;  // 이번 대화 내용 ("아이: …", "스택짱: …")
++    bool memory_update_pending_ = false;
++    std::unique_ptr<Http> memory_http_;
++    void MemoryLoop();
++    void RequestMemoryUpdate();
++    void UpdateMemory(const std::string& dialog);
 +
 +    std::atomic<bool> thinking_param_ok_{true};
 +    std::unique_ptr<Http> llm_http_;
