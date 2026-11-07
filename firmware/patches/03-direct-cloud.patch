@@ -185,10 +185,10 @@ index b79d033..cd06ad5 100644
  #else
 diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
 new file mode 100644
-index 0000000..90e9dc6
+index 0000000..9c291e4
 --- /dev/null
 +++ b/main/boards/m5stack/stackchan/reactions.h
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,330 @@
 +// direct-cloud: 터치·흔들기 반응과 대기 중 표정 변화
 +//
 +// - 터치 (FT6336, 0x38): 톡 치기 / 쓰다듬기(길게) / 간지럼(문지르기) / 여러 번 콕콕
@@ -211,6 +211,7 @@ index 0000000..90e9dc6
 +#include <cmath>
 +#include <functional>
 +#include <string>
++#include <vector>
 +
 +// BMI270 설정 파일 (espressif/bmi270_sensor 부품에 들어 있는 8KB 바이너리)
 +extern "C" const uint8_t bmi270_config_file[];
@@ -298,11 +299,17 @@ index 0000000..90e9dc6
 +    bool has_accel_ = false;
 +    std::function<void()> on_activity_;
 +
-+    // 표정을 잠깐 바꿨다가 되돌리기
-+    int64_t revert_at_us_ = 0;
-+    std::string revert_to_;
-+    std::string chained_;  // 첫 표정 뒤에 이어서 보여 줄 표정 (깜짝 → 어지러움)
-+    int64_t chained_at_us_ = 0;
++    // 반응 = 순서대로 보여 줄 표정 목록. 한 번 바뀐 표정은 최소 kMinHoldUs 동안 유지한다.
++    struct Step {
++        std::string face;
++        int ms;
++    };
++    static constexpr int64_t kMinHoldUs = 1500 * 1000;
++    std::vector<Step> seq_;          // 지금 보여 주는 반응
++    size_t seq_idx_ = 0;
++    int64_t step_end_us_ = 0;
++    std::vector<Step> pending_;      // 유지 시간 중에 들어온 반응 (마지막 것만 남긴다)
++    int64_t face_since_us_ = 0;      // 마지막으로 표정을 바꾼 시각
 +
 +    // 터치 상태
 +    bool touching_ = false;
@@ -319,7 +326,6 @@ index 0000000..90e9dc6
 +
 +    // 대기 상태
 +    DeviceState last_state_ = kDeviceStateUnknown;
-+    int64_t state_since_us_ = 0;
 +    int64_t last_activity_us_ = 0;  // 마지막으로 대화하거나 만지거나 흔든 시각 (졸림 판단 기준)
 +    int64_t next_idle_fx_us_ = 0;
 +    bool sleepy_ = false;
@@ -327,7 +333,8 @@ index 0000000..90e9dc6
 +    static int64_t Now() { return esp_timer_get_time(); }
 +    static uint32_t Rand(uint32_t n) { return esp_random() % n; }
 +
-+    static void SetFace(const std::string& emotion) {
++    void SetFace(const std::string& emotion) {
++        face_since_us_ = Now();
 +        auto& app = Application::GetInstance();
 +        app.Schedule([emotion]() {
 +            auto display = Board::GetInstance().GetDisplay();
@@ -335,24 +342,44 @@ index 0000000..90e9dc6
 +        });
 +    }
 +
-+    // 지금 상태에서 돌아갈 기본 얼굴
-+    static std::string BaseFace(DeviceState s) {
-+        return s == kDeviceStateSpeaking ? "happy" : "neutral";
-+    }
-+
 +    static bool ReactionsAllowed(DeviceState s) {
 +        return s == kDeviceStateIdle || s == kDeviceStateListening || s == kDeviceStateSpeaking ||
 +               s == kDeviceStateConnecting;
 +    }
 +
-+    void Show(const std::string& face, int ms, DeviceState s) {
-+        SetFace(face);
-+        revert_to_ = BaseFace(s);
-+        revert_at_us_ = Now() + (int64_t)ms * 1000;
++    bool Busy() const { return !seq_.empty(); }
++
++    void StartSeq(std::vector<Step> seq) {
++        seq_ = std::move(seq);
++        seq_idx_ = 0;
++        SetFace(seq_[0].face);
++        step_end_us_ = Now() + (int64_t)seq_[0].ms * 1000;
++    }
++
++    // 사용자가 만지거나 흔들어서 생긴 반응
++    void Request(std::vector<Step> seq) {
++        int64_t now = Now();
 +        sleepy_ = false;
-+        last_activity_us_ = Now();  // 놀아 주면 잠이 깬다
-+        next_idle_fx_us_ = Now() + 15LL * 1000 * 1000;
++        last_activity_us_ = now;  // 놀아 주면 잠이 깬다
++        next_idle_fx_us_ = now + 15LL * 1000 * 1000;
 +        if (on_activity_) on_activity_();
++        if (Busy() && now - face_since_us_ < kMinHoldUs) {
++            pending_ = std::move(seq);  // 지금 표정을 조금 더 보여 준 뒤에
++        } else {
++            pending_.clear();
++            StartSeq(std::move(seq));
++        }
++    }
++
++    // 반응이 끝난 뒤 돌아갈 얼굴
++    void Settle(DeviceState state, int64_t now) {
++        if (!ReactionsAllowed(state) || touching_) return;
++        if (state == kDeviceStateIdle && now - last_activity_us_ > 120LL * 1000 * 1000) {
++            sleepy_ = true;
++            SetFace("sleepy");
++        } else {
++            SetFace(state == kDeviceStateSpeaking ? "happy" : "neutral");
++        }
 +    }
 +
 +    void Loop() {
@@ -362,13 +389,14 @@ index 0000000..90e9dc6
 +            int64_t now = Now();
 +            DeviceState state = Application::GetInstance().GetDeviceState();
 +            if (state != last_state_) {
++                // 상태가 바뀌면 앱이 정한 표정을 존중하고 반응은 접는다
 +                last_state_ = state;
-+                state_since_us_ = now;
 +                last_activity_us_ = now;
 +                sleepy_ = false;
 +                next_idle_fx_us_ = now + (15 + Rand(20)) * 1000000LL;
-+                revert_at_us_ = 0;
-+                chained_.clear();
++                seq_.clear();
++                pending_.clear();
++                face_since_us_ = now;
 +            }
 +            bool allowed = ReactionsAllowed(state);
 +
@@ -378,33 +406,30 @@ index 0000000..90e9dc6
 +                PollShake(now, state, allowed);
 +            }
 +
-+            // 이어지는 표정 / 원래 얼굴로 되돌리기
-+            if (!chained_.empty() && now >= chained_at_us_) {
-+                SetFace(chained_);
-+                chained_.clear();
-+            } else if (revert_at_us_ && now >= revert_at_us_ && chained_.empty()) {
-+                revert_at_us_ = 0;
-+                if (ReactionsAllowed(state) && !touching_) {
-+                    // 대기 중이고 오래 혼자였으면 무표정을 거치지 않고 바로 졸린 얼굴로
-+                    if (state == kDeviceStateIdle && now - last_activity_us_ > 120LL * 1000 * 1000) {
-+                        sleepy_ = true;
-+                        SetFace("sleepy");
-+                    } else {
-+                        SetFace(revert_to_);
-+                    }
++            // 기다리던 반응: 지금 표정을 최소 시간 보여 줬으면 바로 바꾼다
++            if (!pending_.empty() && now - face_since_us_ >= kMinHoldUs) {
++                StartSeq(std::move(pending_));
++                pending_.clear();
++            }
++            // 반응 진행: 다음 표정으로, 다 끝나면 원래 얼굴로
++            if (Busy() && now >= step_end_us_) {
++                if (++seq_idx_ < seq_.size()) {
++                    SetFace(seq_[seq_idx_].face);
++                    step_end_us_ = now + (int64_t)seq_[seq_idx_].ms * 1000;
++                } else {
++                    seq_.clear();
++                    Settle(state, now);
 +                }
 +            }
 +
 +            // 대기 중: 가끔 표정 놀이, 오래 혼자면 졸림
-+            if (state == kDeviceStateIdle && !touching_ && revert_at_us_ == 0 && chained_.empty()) {
++            if (state == kDeviceStateIdle && !touching_ && !Busy() && pending_.empty()) {
 +                if (!sleepy_ && now - last_activity_us_ > 120LL * 1000 * 1000) {
 +                    sleepy_ = true;
 +                    SetFace("sleepy");
-+                } else if (!sleepy_ && now >= next_idle_fx_us_) {
++                } else if (!sleepy_ && now >= next_idle_fx_us_ && now - face_since_us_ >= kMinHoldUs) {
 +                    static const char* kIdleFx[] = {"winking", "relaxed", "idle", "happy", "silly"};
-+                    SetFace(kIdleFx[Rand(5)]);
-+                    revert_to_ = "neutral";
-+                    revert_at_us_ = now + (1200 + Rand(1500)) * 1000LL;
++                    StartSeq({{kIdleFx[Rand(5)], (int)(1800 + Rand(1500))}});
 +                    next_idle_fx_us_ = now + (20 + Rand(25)) * 1000000LL;
 +                }
 +            }
@@ -430,16 +455,12 @@ index 0000000..90e9dc6
 +            // 좌우로 문지르면 간지럼
 +            if (allowed && !long_press_shown_ && touch_x_max_ - touch_x_min_ > 80) {
 +                long_press_shown_ = true;
-+                Show("laughing", 2500, state);
++                Request({{"laughing", 2500}});
 +            }
-+            // 가만히 오래 대고 있으면 쓰다듬기
++            // 가만히 오래 대고 있으면 쓰다듬기 (손을 뗄 때까지 편안한 얼굴)
 +            if (allowed && !long_press_shown_ && now - touch_start_us_ > 700 * 1000) {
 +                long_press_shown_ = true;
-+                SetFace("relaxed");
-+                revert_at_us_ = 0;
-+                sleepy_ = false;
-+                last_activity_us_ = now;
-+                if (on_activity_) on_activity_();
++                Request({{"relaxed", 60000}});
 +            }
 +        } else if (num == 0 && touching_) {
 +            touching_ = false;
@@ -448,27 +469,27 @@ index 0000000..90e9dc6
 +            ESP_LOGI(RTAG, "Touch held=%lld ms dx=%d", held / 1000, touch_x_max_ - touch_x_min_);
 +            if (!allowed) return;
 +            if (long_press_shown_) {
-+                // 쓰다듬기가 끝나면 좋아하는 얼굴
-+                if (held > 700 * 1000 && touch_x_max_ - touch_x_min_ <= 80) Show("loving", 2500, state);
-+                else if (revert_at_us_ == 0) Show("happy", 1500, state);
++                // 쓰다듬기가 끝나면 좋아하는 얼굴 (간지럼이었으면 웃는 얼굴을 그대로 이어 간다)
++                if (touch_x_max_ - touch_x_min_ <= 80) {
++                    seq_.clear();
++                    face_since_us_ = 0;  // 편안한 얼굴은 충분히 보여 줬으니 바로 바꾼다
++                    Request({{"loving", 2500}});
++                }
 +                return;
 +            }
-+            // 짧게 톡: 최근 1.5초 안에 여러 번이면 콕콕 찌르기
++            // 짧게 톡: 최근 2초 안에 여러 번이면 콕콕 찌르기
 +            for (int i = 3; i > 0; i--) tap_times_[i] = tap_times_[i - 1];
 +            tap_times_[0] = now;
 +            int recent = 0;
-+            for (auto t : tap_times_) if (t && now - t < 1500 * 1000) recent++;
++            for (auto t : tap_times_) if (t && now - t < 2000 * 1000) recent++;
 +            if (recent >= 4) {
-+                Show("angry", 1500, state);
-+                chained_ = "embarrassed";
-+                chained_at_us_ = now + 1500 * 1000;
-+                revert_at_us_ = now + 3200 * 1000;
++                Request({{"angry", 1800}, {"embarrassed", 2000}});
 +                tap_times_[1] = tap_times_[2] = tap_times_[3] = 0;
 +            } else if (recent >= 2) {
-+                Show(Rand(2) ? "surprised" : "embarrassed", 1500, state);
++                Request({{Rand(2) ? "surprised" : "embarrassed", 2500}});
 +            } else {
 +                static const char* kTap[] = {"happy", "winking", "loving", "funny"};
-+                Show(kTap[Rand(4)], 1500, state);
++                Request({{kTap[Rand(4)], 2500}});
 +            }
 +        }
 +    }
@@ -487,11 +508,12 @@ index 0000000..90e9dc6
 +            last_shake_us_ = now;
 +            shake_hits_ = 0;
 +            ESP_LOGI(RTAG, "Shake detected (%.2fg)", mag);
-+            // 깜짝 → 어지러움(헷갈리는 얼굴) → 원래대로
-+            Show("shocked", 1200, state);
-+            chained_ = "confused";
-+            chained_at_us_ = now + 1200 * 1000;
-+            revert_at_us_ = now + 3500 * 1000;
++            // 깜짝 → 어지러움(헷갈리는 얼굴) → 원래대로. 흔들기는 기다리지 않고 바로 보여 준다
++            pending_.clear();
++            StartSeq({{"shocked", 1500}, {"confused", 2200}});
++            sleepy_ = false;
++            last_activity_us_ = now;
++            if (on_activity_) on_activity_();
 +        }
 +    }
 +};
