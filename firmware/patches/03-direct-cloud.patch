@@ -209,10 +209,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..2a4370a
+index 0000000..2edea99
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,1172 @@
+@@ -0,0 +1,1260 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -252,10 +252,12 @@ index 0000000..2a4370a
 +constexpr size_t kHistoryTurns = 6;             // 기억할 대화 턴 수
 +constexpr int64_t kIdleListenUs = 10 * 1000 * 1000;  // 이만큼 아무 말도 안 들리면 듣기를 끝내고 대기로
 +
-+const char* kDeepgramUrl =
-+    "wss://api.deepgram.com/v1/listen?model=nova-3&language=ko&encoding=linear16"
-+    "&sample_rate=16000&channels=1&interim_results=true&endpointing=800"
-+    "&utterance_end_ms=1000&smart_format=true&punctuate=true";
++std::string DeepgramUrl(int sample_rate) {
++    return std::string("wss://api.deepgram.com/v1/listen?model=nova-3&language=ko&encoding=linear16"
++                       "&sample_rate=") + std::to_string(sample_rate) +
++           "&channels=1&interim_results=true&endpointing=800"
++           "&utterance_end_ms=1000&smart_format=true&punctuate=true";
++}
 +const char* kDeepseekUrl = "https://api.deepseek.com/chat/completions";
 +const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
 +const char* kFallbackVoice = "ko-KR-Wavenet-A";  // 설정한 음성이 거부되면 이걸로
@@ -392,6 +394,8 @@ index 0000000..2a4370a
 +    if (tts_thread_.joinable()) tts_thread_.join();
 +    if (player_thread_.joinable()) player_thread_.join();
 +    if (memory_thread_.joinable()) memory_thread_.join();
++    up_cv_.notify_all();
++    if (upload_thread_.joinable()) upload_thread_.join();
 +    if (keepalive_timer_) {
 +        esp_timer_stop(keepalive_timer_);
 +        esp_timer_delete(keepalive_timer_);
@@ -451,6 +455,11 @@ index 0000000..2a4370a
 +    cfg.thread_name = "direct_mem";
 +    esp_pthread_set_cfg(&cfg);
 +    memory_thread_ = std::thread([this]() { MemoryLoop(); });
++    cfg.stack_size = 6 * 1024;
++    cfg.prio = 4;
++    cfg.thread_name = "direct_up";
++    esp_pthread_set_cfg(&cfg);
++    upload_thread_ = std::thread([this]() { UploadLoop(); });
 +    auto def = esp_pthread_get_default_config();
 +    esp_pthread_set_cfg(&def);
 +
@@ -539,12 +548,14 @@ index 0000000..2a4370a
 +        if (channel_open_.exchange(false) && on_audio_channel_closed_) on_audio_channel_closed_();
 +    });
 +    int64_t t0 = esp_timer_get_time();
-+    if (!asr_ws_->Connect(kDeepgramUrl)) {
++    int rate = slow_network_ ? 8000 : 16000;
++    if (!asr_ws_->Connect(DeepgramUrl(rate).c_str())) {
 +        ESP_LOGE(TAG, "Deepgram connect failed");
 +        asr_ws_.reset();
 +        return false;
 +    }
-+    ESP_LOGI(TAG, "Deepgram connected in %lld ms", (esp_timer_get_time() - t0) / 1000);
++    asr_rate_ = rate;
++    ESP_LOGI(TAG, "Deepgram connected in %lld ms (%d Hz)", (esp_timer_get_time() - t0) / 1000, rate);
 +    last_audio_sent_us_ = esp_timer_get_time();
 +    return true;
 +}
@@ -556,6 +567,14 @@ index 0000000..2a4370a
 +    }
 +    error_occurred_ = false;
 +    int64_t t0 = esp_timer_get_time();
++    {
++        int want = slow_network_ ? 8000 : 16000;
++        std::lock_guard<std::mutex> lock(ws_mutex_);
++        if (asr_ws_ && asr_ws_->IsConnected() && asr_rate_ != want) {
++            ESP_LOGW(TAG, "Network %s: reconnecting Deepgram at %d Hz", want == 8000 ? "slow" : "recovered", want);
++            asr_ws_.reset();
++        }
++    }
 +    if (!EnsureAsrConnected()) {
 +        SetError("음성 인식 서버에 연결하지 못했어요. 키와 네트워크를 확인해 주세요.");
 +        return false;
@@ -586,25 +605,85 @@ index 0000000..2a4370a
 +
 +bool DirectProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 +    if (!listening_ || !asr_ws_ || !asr_ws_->IsConnected()) return true;
-+    // AudioService가 PCM16(16kHz, mono) 원음을 그대로 넘겨준다 (SetPcmPassthrough)
-+    int64_t t0 = esp_timer_get_time();
-+    last_audio_sent_us_ = t0;
-+    bool ok = asr_ws_->Send(packet->payload.data(), packet->payload.size(), true);
-+    int64_t dt = esp_timer_get_time() - t0;
-+
-+    // 업로드가 실시간을 따라가는지 3초마다 기록 (audio가 wall보다 많이 작으면 밀리는 중)
-+    up_audio_ms_ += packet->payload.size() / (kUpSampleRate / 1000 * 2);
-+    if (dt > up_max_send_us_) up_max_send_us_ = dt;
-+    if (up_window_start_us_ == 0) up_window_start_us_ = t0;
-+    int64_t wall = esp_timer_get_time() - up_window_start_us_;
-+    if (wall > 3 * 1000 * 1000) {
-+        ESP_LOGI(TAG, "UP audio=%lld ms wall=%lld ms slowest_send=%lld ms", up_audio_ms_,
-+                 wall / 1000, up_max_send_us_ / 1000);
-+        up_audio_ms_ = 0;
-+        up_max_send_us_ = 0;
-+        up_window_start_us_ = esp_timer_get_time();
++    // AudioService가 PCM16(16kHz, mono) 원음을 넘겨준다. 느린 네트워크면 8kHz로 줄여 보낸다
++    std::vector<uint8_t> data;
++    if (asr_rate_ == 8000) {
++        const int16_t* in = reinterpret_cast<const int16_t*>(packet->payload.data());
++        size_t n = packet->payload.size() / 2 / 2;
++        data.resize(n * 2);
++        int16_t* out = reinterpret_cast<int16_t*>(data.data());
++        for (size_t k = 0; k < n; k++) out[k] = (int16_t)(((int)in[2 * k] + (int)in[2 * k + 1]) / 2);
++    } else {
++        data = std::move(packet->payload);
 +    }
-+    return ok;
++    int64_t ms = (int64_t)data.size() / (asr_rate_ / 1000 * 2);
++    {
++        std::lock_guard<std::mutex> lock(up_mutex_);
++        up_queue_.push_back(std::move(data));
++        up_queued_ms_ += ms;
++        // 2초 넘게 밀리면 오래된 것부터 버린다 (늦은 음성은 인식에 쓸모가 없다)
++        while (up_queued_ms_ > 2000 && !up_queue_.empty()) {
++            up_queued_ms_ -= (int64_t)up_queue_.front().size() / (asr_rate_ / 1000 * 2);
++            up_queue_.pop_front();
++            up_dropped_++;
++        }
++    }
++    up_cv_.notify_one();
++    return true;
++}
++
++void DirectProtocol::UploadLoop() {
++    while (true) {
++        std::vector<uint8_t> data;
++        int64_t queued_ms;
++        {
++            std::unique_lock<std::mutex> lock(up_mutex_);
++            up_cv_.wait(lock, [this]() { return stop_ || !up_queue_.empty(); });
++            if (stop_) return;
++            data = std::move(up_queue_.front());
++            up_queue_.pop_front();
++            int64_t ms = (int64_t)data.size() / (asr_rate_ / 1000 * 2);
++            up_queued_ms_ -= ms;
++            queued_ms = up_queued_ms_;
++        }
++        if (!listening_ || !asr_ws_ || !asr_ws_->IsConnected()) continue;
++        int64_t t0 = esp_timer_get_time();
++        last_audio_sent_us_ = t0;
++        asr_ws_->Send(data.data(), data.size(), true);
++        int64_t dt = esp_timer_get_time() - t0;
++
++        // 3초마다 업로드 상태 점검: 실시간의 70%도 못 보내거나 버린 게 있으면 "느림"
++        up_audio_ms_ += (int64_t)data.size() / (asr_rate_ / 1000 * 2);
++        if (dt > up_max_send_us_) up_max_send_us_ = dt;
++        if (up_window_start_us_ == 0) up_window_start_us_ = t0;
++        int64_t wall = esp_timer_get_time() - up_window_start_us_;
++        if (wall > 3 * 1000 * 1000) {
++            int dropped;
++            {
++                std::lock_guard<std::mutex> lock(up_mutex_);
++                dropped = up_dropped_;
++                up_dropped_ = 0;
++            }
++            ESP_LOGI(TAG, "UP audio=%lld ms wall=%lld ms slowest_send=%lld ms queued=%lld ms dropped=%d rate=%d",
++                     up_audio_ms_, wall / 1000, up_max_send_us_ / 1000, queued_ms, dropped, (int)asr_rate_);
++            bool bad = up_audio_ms_ * 10 < wall / 1000 * 7 || dropped > 0;
++            bool good = up_audio_ms_ * 100 >= wall / 1000 * 95 && up_max_send_us_ < 150 * 1000;
++            if (bad) {
++                good_windows_ = 0;
++                if (!slow_network_) ESP_LOGW(TAG, "Upload too slow, next session uses 8 kHz");
++                slow_network_ = true;
++                int64_t now = esp_timer_get_time();
++                if (now - last_notice_us_ > 300LL * 1000 * 1000) notice_pending_ = true;
++            } else if (good && slow_network_ && ++good_windows_ >= 10) {
++                ESP_LOGI(TAG, "Upload healthy again, next session uses 16 kHz");
++                slow_network_ = false;
++                good_windows_ = 0;
++            }
++            up_audio_ms_ = 0;
++            up_max_send_us_ = 0;
++            up_window_start_us_ = esp_timer_get_time();
++        }
++    }
 +}
 +
 +void DirectProtocol::SendStartListening(ListeningMode mode) {
@@ -618,6 +697,11 @@ index 0000000..2a4370a
 +    up_audio_ms_ = 0;
 +    up_max_send_us_ = 0;
 +    up_window_start_us_ = 0;
++    {
++        std::lock_guard<std::mutex> l2(up_mutex_);
++        up_queue_.clear();
++        up_queued_ms_ = 0;
++    }
 +    listening_ = true;
 +}
 +
@@ -816,6 +900,10 @@ index 0000000..2a4370a
 +                sys += "\n\n[이 아이에 대해 기억하고 있는 것]\n" + memory_ +
 +                       "\n이걸 자연스럽게 활용해서 맞춤으로 대답해. 기억을 줄줄이 읽어 주지는 마.";
 +            }
++        }
++        if (notice_pending_.exchange(false)) {
++            last_notice_us_ = esp_timer_get_time();
++            sys += "\n지금 인터넷이 느려서 말을 잘못 알아들었을 수 있어. 이번 대답은 '인터넷이 조금 느린 것 같아.'로 짧게 시작해.";
 +        }
 +        add("system", sys);
 +    }
@@ -1387,10 +1475,10 @@ index 0000000..2a4370a
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..92568b8
+index 0000000..9ba35f9
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,154 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1495,7 +1583,20 @@ index 0000000..92568b8
 +    std::deque<Sentence> tts_jobs_;
 +    std::deque<Chunk> chunks_;
 +    bool stop_ = false;
-+    std::thread llm_thread_, tts_thread_, player_thread_, memory_thread_;
++    std::thread llm_thread_, tts_thread_, player_thread_, memory_thread_, upload_thread_;
++
++    // 업로드: 전송이 막혀도 기기가 굳지 않도록 별도 스레드와 대기열로 보낸다
++    std::mutex up_mutex_;
++    std::condition_variable up_cv_;
++    std::deque<std::vector<uint8_t>> up_queue_;
++    int64_t up_queued_ms_ = 0;
++    int up_dropped_ = 0;
++    std::atomic<int> asr_rate_{16000};        // 지금 Deepgram 연결의 샘플레이트
++    std::atomic<bool> slow_network_{false};   // 업로드가 실시간을 못 따라가면 다음 연결은 8kHz
++    int good_windows_ = 0;
++    std::atomic<bool> notice_pending_{false}; // 다음 대답 첫마디에 "인터넷이 느려" 안내
++    int64_t last_notice_us_ = 0;
++    void UploadLoop();
 +
 +    // 기억 메모: 대화 중에는 읽기만, 대화가 끝나면 뒤에서 갱신
 +    std::mutex memory_mutex_;
