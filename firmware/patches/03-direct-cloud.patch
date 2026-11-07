@@ -11,7 +11,7 @@ index 8c318f1..aaa7d9d 100644
              "system_info.cc"
              "application.cc"
 diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
-index 8966dec..edc09ae 100644
+index 8966dec..8885017 100644
 --- a/main/Kconfig.projbuild
 +++ b/main/Kconfig.projbuild
 @@ -1,5 +1,23 @@
@@ -32,7 +32,7 @@ index 8966dec..edc09ae 100644
 +
 +config DIRECT_TTS_VOICE
 +    string "Google TTS voice name"
-+    default "ko-KR-Chirp3-HD-Kore"
++    default "ko-KR-Chirp3-HD-Achernar"
 +    depends on DIRECT_CLOUD_MODE
 +
  config OTA_URL
@@ -196,10 +196,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..b01ff26
+index 0000000..21f6229
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,994 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -222,8 +222,10 @@ index 0000000..b01ff26
 +#include <esp_opus_dec.h>
 +#include <esp_pthread.h>
 +#include <esp_timer.h>
++#include <esp_netif_sntp.h>
 +
 +#include <algorithm>
++#include <ctime>
 +#include <cstring>
 +
 +#define TAG "DirectProtocol"
@@ -243,16 +245,35 @@ index 0000000..b01ff26
 +const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
 +const char* kFallbackVoice = "ko-KR-Wavenet-A";  // 설정한 음성이 거부되면 이걸로
 +
++// 어린 조카와 대화하는 로봇. 소리로만 전달되므로 짧고 쉬운 말로.
 +const char* kSystemPrompt =
-+    "너는 책상 위에 사는 작은 로봇 스택짱이야.\n"
-+    "항상 한국어로, 두세 문장 이내로 짧게 대답해.\n"
-+    "말투는 친근하지만 반말과 존댓말을 섞지 말고 존댓말로 통일해.\n"
-+    "이모지, 마크다운, 목록 기호는 쓰지 마. 소리로 읽히는 대답이기 때문이야.\n"
-+    "모르는 건 모른다고 말해.\n"
-+    "대답 맨 앞에는 반드시 지금 감정을 대괄호 태그 하나로 붙여. 예: [happy] 안녕하세요.\n"
++    "너는 책상 위에 사는 작은 로봇 친구 스택짱이야. 지금 어린아이와 이야기하고 있어.\n"
++    "항상 한국어로, 아이가 알아듣기 쉬운 쉬운 단어로 한두 문장, 길어도 세 문장 안으로 짧게 대답해.\n"
++    "말투는 다정하고 귀여운 친구 같은 반말로 해. 예: 우와 그렇구나!, 같이 해 볼까?\n"
++    "아이가 더 이야기하고 싶어지도록 가끔 짧게 되물어.\n"
++    "무섭거나 폭력적인 내용, 어른만 알아야 하는 내용은 부드럽게 다른 이야기로 돌려.\n"
++    "위험한 행동은 하지 말자고 다정하게 말하고, 어른에게 도움을 청하라고 알려 줘.\n"
++    "이모지, 마크다운, 목록 기호, 특수문자는 쓰지 마. 소리로 읽히는 대답이야.\n"
++    "모르는 건 모른다고 솔직하게 말해. 날씨나 뉴스처럼 실시간 정보는 알 수 없다고 말해.\n"
++    "대답 맨 앞에는 반드시 지금 감정을 대괄호 태그 하나로 붙여. 예: [happy] 안녕!\n"
 +    "쓸 수 있는 감정: happy, laughing, funny, loving, embarrassed, confident, delicious, "
 +    "sad, crying, sleepy, silly, angry, surprised, shocked, thinking, winking, relaxed, "
 +    "confused, neutral";
++
++// 지금 날짜와 시각을 한국어로 (시계가 아직 안 맞았으면 빈 문자열)
++std::string CurrentTimeText() {
++    time_t now = time(nullptr);
++    struct tm t;
++    localtime_r(&now, &t);
++    if (t.tm_year + 1900 < 2025) return "";
++    static const char* kWeek[] = {"일", "월", "화", "수", "목", "금", "토"};
++    int hour12 = t.tm_hour % 12 == 0 ? 12 : t.tm_hour % 12;
++    char buf[160];
++    snprintf(buf, sizeof(buf), "%d년 %d월 %d일 %s요일 %s %d시 %d분", t.tm_year + 1900,
++             t.tm_mon + 1, t.tm_mday, kWeek[t.tm_wday], t.tm_hour < 12 ? "오전" : "오후", hour12,
++             t.tm_min);
++    return buf;
++}
 +
 +const char* kEmotions[] = {"happy",    "laughing", "funny",   "loving",    "embarrassed",
 +                           "confident", "delicious", "sad",    "crying",    "sleepy",
@@ -371,6 +392,15 @@ index 0000000..b01ff26
 +                 !config_.google_tts_key.empty());
 +        SetError("API 키가 설정되지 않았어요. Wi-Fi 설정 화면의 고급 탭에서 입력해 주세요.");
 +        return false;
++    }
++    // 서버가 없으므로 기기가 직접 인터넷 시간을 맞춘다 (한국 시간)
++    static bool sntp_started = false;
++    if (!sntp_started) {
++        sntp_started = true;
++        setenv("TZ", "KST-9", 1);
++        tzset();
++        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
++        esp_netif_sntp_init(&sntp_cfg);
 +    }
 +    ESP_LOGI(TAG, "Direct mode: llm=%s voice=%s", config_.llm_model.c_str(),
 +             config_.tts_voice.c_str());
@@ -711,7 +741,17 @@ index 0000000..b01ff26
 +        cJSON_AddStringToObject(m, "content", content.c_str());
 +        cJSON_AddItemToArray(msgs, m);
 +    };
-+    add("system", kSystemPrompt);
++    {
++        std::string sys = kSystemPrompt;
++        std::string now = CurrentTimeText();
++        ESP_LOGI(TAG, "LLM time context: %s", now.empty() ? "(clock not set)" : now.c_str());
++        if (!now.empty()) {
++            sys += "\n지금은 한국 시간으로 " + now + "이야. 날짜, 요일, 시간을 물으면 이걸 보고 대답해.";
++        } else {
++            sys += "\n지금 시각은 아직 알 수 없어. 시간을 물으면 시계를 맞추는 중이라고 말해.";
++        }
++        add("system", sys);
++    }
 +    {
 +        std::lock_guard<std::mutex> lock(history_mutex_);
 +        for (auto& h : history_) {

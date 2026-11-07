@@ -61,7 +61,7 @@ Google은 결제 수단 등록이 있어야 쓸 수 있다. 무료 사용량(기
 3. 첫 화면(Wi-Fi Config) 한 곳에서 모두 입력한다.
    - 아래 목록에서 사용할 장소의 2.4GHz Wi-Fi를 고르고 비밀번호 입력
    - Deepgram / DeepSeek / Google TTS 키 칸에 복사해 둔 키를 붙여 넣기
-   - TTS 음성 이름은 비워 두면 `ko-KR-Chirp3-HD-Kore`. 다른 목소리는 `ko-KR-Chirp3-HD-Aoede`, `ko-KR-Wavenet-A` 등. 설정한 음성이 거부되면 자동으로 `ko-KR-Wavenet-A`로 바뀐다
+   - TTS 음성 이름은 비워 두면 `ko-KR-Chirp3-HD-Achernar`. 다른 목소리는 `ko-KR-Chirp3-HD-Aoede`, `ko-KR-Wavenet-A` 등. 설정한 음성이 거부되면 자동으로 `ko-KR-Wavenet-A`로 바뀐다
 4. **Connect** → 키가 먼저 저장되고 Wi-Fi에 연결된다.
 5. 기기가 재부팅하고 바로 대화할 수 있는 상태가 된다. "Hi,ESP"로 깨운다.
 
@@ -93,7 +93,7 @@ Google은 결제 수단 등록이 있어야 쓸 수 있다. 무료 사용량(기
 
 - Deepgram 실시간 인식이 `nova-3` + 한국어(`ko`) 조합을 받아 주는지 (서버에서는 같은 조합을 일괄 인식으로 쓰고 있음)
 - DeepSeek 모델 이름 `deepseek-flash` (서버 설정에서 가져온 값)
-- Google 음성 `ko-KR-Chirp3-HD-Kore`가 OGG_OPUS 24kHz 요청을 받는지 (거부되면 WaveNet으로 자동 전환)
+- Google 음성 `ko-KR-Chirp3-HD-Achernar`가 OGG_OPUS 24kHz 요청을 받는지 (거부되면 WaveNet으로 자동 전환)
 - 음성 인식 연결 1개 + 답변 1개 + 음성 합성 1개, 암호화 연결 3개를 동시에 여는 메모리 상황
 
 모델 이름이나 음성 이름이 틀리면 로그에 400/404 오류로 바로 드러난다. 그러면 기본값만 바꿔서 다시 빌드하면 된다.

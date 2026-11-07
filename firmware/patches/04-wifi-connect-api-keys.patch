@@ -1,6 +1,6 @@
 diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b/assets/wifi_configuration.html
 --- a/assets/wifi_configuration.html	2026-11-06 01:04:26.391156182 +0000
-+++ b/assets/wifi_configuration.html	2026-11-07 12:35:53.699138198 +0000
++++ b/assets/wifi_configuration.html	2026-11-07 13:07:58.375306194 +0000
 @@ -534,9 +534,26 @@
                      <label for="password" data-lang="password">Password:</label>
                      <input type="password" id="password" name="password">
@@ -15,8 +15,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    <input type="password" id="gtts_key" name="gtts_key" autocomplete="off" autocapitalize="off" spellcheck="false">
 +                    <p style="font-size: 12px; opacity: 0.7;">비워 두면 저장된 키를 그대로 씁니다.</p>
 +                    <label for="tts_voice">TTS 음성 이름</label>
-+                    <input type="text" id="tts_voice" name="tts_voice" placeholder="ko-KR-Chirp3-HD-Kore" autocomplete="off" autocapitalize="off" spellcheck="false">
-+                    <p style="font-size: 12px; opacity: 0.7;">예: ko-KR-Chirp3-HD-Kore, ko-KR-Chirp3-HD-Aoede, ko-KR-Chirp3-HD-Charon, ko-KR-Wavenet-A. 비워 두면 ko-KR-Chirp3-HD-Kore.</p>
++                    <input type="text" id="tts_voice" name="tts_voice" placeholder="ko-KR-Chirp3-HD-Achernar" autocomplete="off" autocapitalize="off" spellcheck="false">
++                    <p style="font-size: 12px; opacity: 0.7;">예: ko-KR-Chirp3-HD-Achernar, ko-KR-Chirp3-HD-Leda, ko-KR-Chirp3-HD-Kore, ko-KR-Wavenet-A. 비워 두면 ko-KR-Chirp3-HD-Achernar.</p>
 +                </div>
 +
                  <p>
