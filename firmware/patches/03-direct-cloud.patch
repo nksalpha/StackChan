@@ -150,10 +150,23 @@ index 358a094..6a4516a 100644
                  esp_audio_enc_in_frame_t in = {
                      .buffer = (uint8_t*)(task.pcm.data()),
 diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
-index b79d033..5fd459c 100644
+index b79d033..cd06ad5 100644
 --- a/main/audio/audio_service.h
 +++ b/main/audio/audio_service.h
-@@ -124,6 +124,8 @@ public:
+@@ -40,7 +40,12 @@
+ #define OPUS_FRAME_DURATION_MS 60
+ #define MAX_ENCODE_TASKS_IN_QUEUE 2
+ #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
++#if CONFIG_DIRECT_CLOUD_MODE
++// direct-cloud: Google TTS는 20ms 프레임이라 같은 개수면 0.4초밖에 못 쌓는다. 2.4초분으로 늘려 끊김 방지
++#define MAX_DECODE_PACKETS_IN_QUEUE (2400 / 20)
++#else
+ #define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
++#endif
+ #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define AUDIO_TESTING_MAX_DURATION_MS 10000
+ #define MAX_TIMESTAMPS_IN_QUEUE 3
+@@ -124,6 +129,8 @@ public:
      const std::string& GetLastWakeWord() const;
      std::vector<std::string> GetWakeWords() const;
      bool IsVoiceDetected() const { return voice_detected_; }
@@ -162,7 +175,7 @@ index b79d033..5fd459c 100644
      bool IsIdle();
      bool IsPlaybackIdle();
      bool IsWakeWordRunning() const {
-@@ -200,6 +202,7 @@ private:
+@@ -200,6 +207,7 @@ private:
  
      bool audio_engine_initialized_ = false;
      bool voice_detected_ = false;
@@ -196,10 +209,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..21f6229
+index 0000000..b0b18dc
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,994 @@
+@@ -0,0 +1,1012 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -234,8 +247,9 @@ index 0000000..21f6229
 +
 +constexpr int kUpSampleRate = 16000;            // 마이크 → Deepgram
 +constexpr int kTtsSampleRate = 24000;           // Google TTS 출력
-+constexpr int64_t kPlaybackLeadUs = 200 * 1000; // 재생 큐에 미리 넣어 둘 오디오 길이
++constexpr int64_t kPlaybackLeadUs = 800 * 1000; // 재생 큐에 미리 넣어 둘 오디오 길이 (네트워크·CPU가 잠깐 밀려도 안 끊기게)
 +constexpr size_t kHistoryTurns = 6;             // 기억할 대화 턴 수
++constexpr int64_t kIdleListenUs = 10 * 1000 * 1000;  // 이만큼 아무 말도 안 들리면 듣기를 끝내고 대기로
 +
 +const char* kDeepgramUrl =
 +    "wss://api.deepgram.com/v1/listen?model=nova-3&language=ko&encoding=linear16"
@@ -254,6 +268,8 @@ index 0000000..21f6229
 +    "무섭거나 폭력적인 내용, 어른만 알아야 하는 내용은 부드럽게 다른 이야기로 돌려.\n"
 +    "위험한 행동은 하지 말자고 다정하게 말하고, 어른에게 도움을 청하라고 알려 줘.\n"
 +    "이모지, 마크다운, 목록 기호, 특수문자는 쓰지 마. 소리로 읽히는 대답이야.\n"
++    "숫자, 시간, 날짜는 아라비아 숫자 대신 한글로 풀어서 띄어쓰기를 바르게 써. "
++    "예: 밤 열두 시 십오 분, 십일월 칠일 토요일, 사과 세 개.\n"
 +    "모르는 건 모른다고 솔직하게 말해. 날씨나 뉴스처럼 실시간 정보는 알 수 없다고 말해.\n"
 +    "대답 맨 앞에는 반드시 지금 감정을 대괄호 태그 하나로 붙여. 예: [happy] 안녕!\n"
 +    "쓸 수 있는 감정: happy, laughing, funny, loving, embarrassed, confident, delicious, "
@@ -652,6 +668,7 @@ index 0000000..21f6229
 +                         is_final ? "final" : "interim", speech_final ? " speech_final" : "",
 +                         from_finalize ? " from_finalize" : "", transcript);
 +                std::lock_guard<std::mutex> lock(asr_mutex_);
++                last_transcript_us_ = esp_timer_get_time();
 +                if (is_final) {
 +                    if (!utterance_.empty()) utterance_ += " ";
 +                    utterance_ += transcript;
@@ -677,6 +694,19 @@ index 0000000..21f6229
 +void DirectProtocol::CheckVadFinalize() {
 +    if (!listening_) return;
 +    int64_t now = esp_timer_get_time();
++    {
++        // 대답 뒤(또는 깨운 뒤) 10초 동안 인식된 말이 없으면 대기 상태로: 계속 올려 보내면 Deepgram 요금이 나간다
++        std::unique_lock<std::mutex> lock(asr_mutex_);
++        bool idle = utterance_.empty() && interim_.empty() &&
++                    now - std::max(listen_start_us_, last_transcript_us_) > kIdleListenUs;
++        lock.unlock();
++        if (idle) {
++            ESP_LOGI(TAG, "No speech for %lld s, back to idle", kIdleListenUs / 1000000);
++            listening_ = false;
++            if (channel_open_.exchange(false) && on_audio_channel_closed_) on_audio_channel_closed_();
++            return;
++        }
++    }
 +    bool voice = Application::GetInstance().GetAudioService().IsVoiceDetected();
 +    bool have_text;
 +    {
@@ -965,6 +995,7 @@ index 0000000..21f6229
 +    ESP_LOGI(TAG, "LAT llm_total=%lld ms", (esp_timer_get_time() - t0) / 1000);
 +
 +    std::string reply = Trim(full_reply);
++    ESP_LOGI(TAG, "<< %s", reply.c_str());
 +    if (!reply.empty() && IsCurrent(turn)) {
 +        std::lock_guard<std::mutex> lock(history_mutex_);
 +        history_.emplace_back(user_text, reply);
@@ -1196,10 +1227,10 @@ index 0000000..21f6229
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..21ba930
+index 0000000..b995fe9
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,130 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1285,6 +1316,7 @@ index 0000000..21ba930
 +    esp_timer_handle_t vad_timer_ = nullptr;
 +    int64_t listen_start_us_ = 0;
 +    int64_t last_voice_us_ = 0;
++    int64_t last_transcript_us_ = 0;
 +    bool had_voice_ = false;
 +    bool finalize_sent_ = false;
 +    int64_t up_audio_ms_ = 0;
