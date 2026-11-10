@@ -706,10 +706,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..bdcc4e2
+index 0000000..4eda8cc
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,1499 @@
+@@ -0,0 +1,1545 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -1140,6 +1140,11 @@ index 0000000..bdcc4e2
 +    channel_open_ = true;
 +    greet_on_listen_ = true;
 +    if (on_audio_channel_opened_) on_audio_channel_opened_();
++    // 사진 질문이 오면 바로 보낼 수 있게 Claude 연결도 뒤에서 미리 맺어 둔다
++    // (대화 스레드와 따로 돌려서 일반 대화의 DeepSeek 요청을 늦추지 않는다)
++    if (!config_.claude_key.empty() && Board::GetInstance().GetCamera() != nullptr) {
++        vision_warm_pending_ = true;
++    }
 +    // 대화가 시작됐으니 답변·음성 합성 연결도 살아 있는지 확인해 둔다
 +    {
 +        std::lock_guard<std::mutex> lock(mutex_);
@@ -1678,25 +1683,41 @@ index 0000000..bdcc4e2
 +    cJSON_Delete(root);
 +    size_t body_size = body.size();
 +
-+    auto network = Board::GetInstance().GetNetwork();
++    std::lock_guard<std::mutex> vlock(vision_mutex_);  // 예열 중이면 끝날 때까지 기다렸다가 그 연결을 쓴다
 +    if (!vision_http_) {
-+        vision_http_ = network->CreateHttp(4);
++        vision_http_ = Board::GetInstance().GetNetwork()->CreateHttp(4);
 +        vision_http_->SetKeepAlive(true);
 +    }
 +    auto& http = vision_http_;
-+    http->SetTimeout(20000);
-+    http->SetHeader("x-api-key", config_.claude_key);
-+    http->SetHeader("anthropic-version", "2026-10-21");
-+    http->SetHeader("Content-Type", "application/json");
-+    http->SetHeader("Accept", "text/event-stream");
-+    http->SetContent(std::move(body));
-+    if (!http->Open("POST", kClaudeUrl)) {
-+        ESP_LOGE(TAG, "Claude open failed");
-+        http->Close();
++    NetworkResult<int> status = std::unexpected(NetworkError::InvalidArgument());
++    bool opened = false;
++    // 미리 맺어 둔 연결이 그 사이 끊겼으면 한 번만 새로 연결해서 다시 보낸다
++    for (int attempt = 0; attempt < 2 && !opened; ++attempt) {
++        http->SetTimeout(20000);
++        http->SetHeader("x-api-key", config_.claude_key);
++        http->SetHeader("anthropic-version", "2026-10-21");
++        http->SetHeader("Content-Type", "application/json");
++        http->SetHeader("Accept", "text/event-stream");
++        http->SetContent(std::string(body));
++        if (!http->Open("POST", kClaudeUrl)) {
++            ESP_LOGW(TAG, "Claude open failed (attempt %d)", attempt + 1);
++            http->Close();
++            continue;
++        }
++        status = http->GetStatusCode();
++        if (!status) {
++            ESP_LOGW(TAG, "Claude no response (attempt %d)", attempt + 1);
++            http->Close();
++            continue;
++        }
++        opened = true;
++    }
++    body.clear();
++    body.shrink_to_fit();
++    if (!opened) {
 +        say("앗, 인터넷이 잘 안 돼서 못 봤어. 다시 보여 줄래?");
 +        return;
 +    }
-+    auto status = http->GetStatusCode();
 +    if (!status || *status != 200) {
 +        std::string err = http->ReadAll();
 +        ESP_LOGE(TAG, "Claude status %d: %.300s", status ? *status : -1, err.c_str());
@@ -1881,10 +1902,11 @@ index 0000000..bdcc4e2
 +            std::unique_lock<std::mutex> lock(mutex_);
 +            cv_.wait(lock, [this]() {
 +                std::lock_guard<std::mutex> l2(memory_mutex_);
-+                return stop_ || memory_update_pending_;
++                return stop_ || memory_update_pending_ || vision_warm_pending_;
 +            });
 +            if (stop_) return;
 +        }
++        if (vision_warm_pending_.exchange(false)) WarmVision();
 +        {
 +            std::lock_guard<std::mutex> lock(memory_mutex_);
 +            memory_update_pending_ = false;
@@ -1893,6 +1915,30 @@ index 0000000..bdcc4e2
 +        }
 +        if (!dialog.empty()) UpdateMemory(dialog);
 +    }
++}
++
++// Claude 연결만 미리 맺는다. 모델 목록 조회라 요금이 들지 않는다.
++void DirectProtocol::WarmVision() {
++    std::lock_guard<std::mutex> lock(vision_mutex_);
++    int64_t t0 = esp_timer_get_time();
++    if (!vision_http_) {
++        vision_http_ = Board::GetInstance().GetNetwork()->CreateHttp(4);
++        vision_http_->SetKeepAlive(true);
++    }
++    auto& http = vision_http_;
++    http->SetTimeout(10000);
++    http->SetHeader("x-api-key", config_.claude_key);
++    http->SetHeader("anthropic-version", "2026-10-21");
++    if (!http->Open("GET", "https://api.anthropic.com/v1/models?limit=1")) {
++        ESP_LOGW(TAG, "Warmup Claude: connect failed");
++        http->Close();
++        return;
++    }
++    auto st = http->GetStatusCode();
++    std::string body = http->ReadAll();
++    ESP_LOGI(TAG, "Warmup Claude status=%d in %lld ms", st ? *st : -1,
++             (esp_timer_get_time() - t0) / 1000);
++    if (!st || *st != 200) ESP_LOGE(TAG, "Claude: %.200s", body.c_str());
 +}
 +
 +void DirectProtocol::UpdateMemory(const std::string& dialog) {
@@ -2211,10 +2257,10 @@ index 0000000..bdcc4e2
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..47b8371
+index 0000000..d1c9b79
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,168 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -2353,6 +2399,9 @@ index 0000000..47b8371
 +    std::unique_ptr<Http> llm_http_;
 +    std::unique_ptr<Http> tts_http_;
 +    std::unique_ptr<Http> vision_http_;
++    std::mutex vision_mutex_;                     // vision_http_ 는 대화 스레드와 예열 스레드가 같이 쓴다
++    std::atomic<bool> vision_warm_pending_{false};
++    void WarmVision();
 +
 +    bool SendText(const std::string& text) override;
 +    bool IsTimeout() const override { return false; }
