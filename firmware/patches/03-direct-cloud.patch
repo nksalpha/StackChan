@@ -11,10 +11,10 @@ index 8c318f1..aaa7d9d 100644
              "system_info.cc"
              "application.cc"
 diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
-index 8966dec..8885017 100644
+index 8966dec..79270ca 100644
 --- a/main/Kconfig.projbuild
 +++ b/main/Kconfig.projbuild
-@@ -1,5 +1,23 @@
+@@ -1,5 +1,28 @@
  menu "Xiaozhi Assistant"
  
 +config DIRECT_CLOUD_MODE
@@ -33,6 +33,11 @@ index 8966dec..8885017 100644
 +config DIRECT_TTS_VOICE
 +    string "Google TTS voice name"
 +    default "ko-KR-Chirp3-HD-Achernar"
++    depends on DIRECT_CLOUD_MODE
++
++config DIRECT_VISION_MODEL
++    string "Claude model for camera questions"
++    default "claude-haiku-5-5"
 +    depends on DIRECT_CLOUD_MODE
 +
  config OTA_URL
@@ -183,6 +188,80 @@ index b79d033..cd06ad5 100644
  #if CONFIG_USE_DEVICE_AEC
      bool device_aec_enabled_ = true;
  #else
+diff --git a/main/boards/common/camera.h b/main/boards/common/camera.h
+index b74bf86..398099f 100644
+--- a/main/boards/common/camera.h
++++ b/main/boards/common/camera.h
+@@ -14,6 +14,8 @@ public:
+     virtual bool SetVFlip(bool enabled) = 0;
+     virtual bool SetSwapBytes(bool enabled) { return false; }  // Optional, default no-op
+     virtual std::expected<std::string, std::string> Explain(const std::string& question) = 0;
++    // direct-cloud: 사진을 찍어 JPEG로 돌려준다 (지원하지 않으면 false)
++    virtual bool CaptureJpeg(std::string& out, int quality = 70) { return false; }
+ };
+ 
+ #endif  // CAMERA_H
+diff --git a/main/boards/common/esp_video.cc b/main/boards/common/esp_video.cc
+index 09cf706..1ae4ca3 100644
+--- a/main/boards/common/esp_video.cc
++++ b/main/boards/common/esp_video.cc
+@@ -19,6 +19,7 @@
+ #include "display.h"
+ #include "esp_jpeg_common.h"
+ #include "esp_video.h"
++#include <esp_pthread.h>
+ #include "jpg/image_to_jpeg.h"
+ #include "jpg/jpeg_to_image.h"
+ #include "lvgl_display.h"
+@@ -947,6 +948,38 @@ bool EspVideo::SetVFlip(bool enabled) {
+  * @note 函数会等待之前的编码线程完成后再开始新的处理
+  * @warning 如果摄像头缓冲区为空或网络连接失败，将返回错误信息
+  */
++// direct-cloud: 찍은 사진을 JPEG로 만들어 돌려준다. 인코더는 내부 RAM 스택에서 돌린다(Explain과 같은 방식).
++bool EspVideo::CaptureJpeg(std::string& out, int quality) {
++    if (!Capture()) return false;
++    if (frame_.data == nullptr || frame_.len == 0) return false;
++    uint8_t* jpg = nullptr;
++    size_t jpg_len = 0;
++    bool ok = false;
++    auto prev = esp_pthread_get_default_config();
++    esp_pthread_get_cfg(&prev);
++    auto cfg = esp_pthread_get_default_config();
++    cfg.stack_size = 8 * 1024;  // 소프트웨어 JPEG 인코더용 (내부 RAM)
++    cfg.thread_name = "jpeg_enc";
++    esp_pthread_set_cfg(&cfg);
++    std::thread enc([&]() {
++        uint16_t w = frame_.width ? frame_.width : 320;
++        uint16_t h = frame_.height ? frame_.height : 240;
++        ok = image_to_jpeg(frame_.data, frame_.len, w, h, frame_.format, (uint8_t)quality, &jpg,
++                           &jpg_len);
++    });
++    enc.join();
++    esp_pthread_set_cfg(&prev);
++    if (!ok || jpg == nullptr || jpg_len == 0) {
++        if (jpg) free(jpg);
++        ESP_LOGE(TAG, "JPEG encode failed");
++        return false;
++    }
++    out.assign(reinterpret_cast<char*>(jpg), jpg_len);
++    free(jpg);
++    ESP_LOGI(TAG, "CaptureJpeg %ux%u -> %u bytes", frame_.width, frame_.height, (unsigned)jpg_len);
++    return true;
++}
++
+ std::expected<std::string, std::string> EspVideo::Explain(const std::string& question) {
+     if (explain_url_.empty()) {
+         return std::unexpected("Image explain URL or token is not set");
+diff --git a/main/boards/common/esp_video.h b/main/boards/common/esp_video.h
+index f36d26a..807f744 100644
+--- a/main/boards/common/esp_video.h
++++ b/main/boards/common/esp_video.h
+@@ -53,4 +53,5 @@ public:
+     virtual bool SetHMirror(bool enabled) override;
+     virtual bool SetVFlip(bool enabled) override;
+     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
++    virtual bool CaptureJpeg(std::string& out, int quality = 70) override;
+ };
 diff --git a/main/boards/m5stack/stackchan/reactions.h b/main/boards/m5stack/stackchan/reactions.h
 new file mode 100644
 index 0000000..7088010
@@ -627,10 +706,10 @@ index c9c64ec..91d140a 100644
      rules:
 diff --git a/main/protocols/direct_protocol.cc b/main/protocols/direct_protocol.cc
 new file mode 100644
-index 0000000..e323730
+index 0000000..bdcc4e2
 --- /dev/null
 +++ b/main/protocols/direct_protocol.cc
-@@ -0,0 +1,1303 @@
+@@ -0,0 +1,1499 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram / DeepSeek / Google TTS를 직접 호출한다.
 +//
 +// 흐름
@@ -655,6 +734,7 @@ index 0000000..e323730
 +#include <esp_pthread.h>
 +#include <esp_timer.h>
 +#include <esp_netif_sntp.h>
++#include <mbedtls/base64.h>
 +
 +#include <algorithm>
 +#include <ctime>
@@ -677,6 +757,40 @@ index 0000000..e323730
 +           "&utterance_end_ms=1000&smart_format=true&punctuate=true";
 +}
 +const char* kDeepseekUrl = "https://api.deepseek.com/chat/completions";
++const char* kClaudeUrl = "https://api.anthropic.com/v1/messages";
++const char* kVisionMarker = "\x01";  // llm_jobs_ 안에서 사진 질문 표시
++
++// 사진 보기 추가 지시 (기본 성격·표정 규칙은 kSystemPrompt 그대로)
++const char* kVisionPrompt =
++    "\n\n지금 아이가 카메라 앞에 무언가를 보여 주면서 물어봤어. 함께 온 사진은 네 눈(카메라)으로 방금 본 장면이야.\n"
++    "사진에서 가장 눈에 띄는 것이 무엇인지 아이 눈높이로 한두 문장, 길어도 세 문장으로 말해 줘.\n"
++    "확실하지 않으면 '~같아', '~인 것 같은데?'처럼 말하고, 잘 안 보이면 조금 더 가까이 보여 달라고 해.\n"
++    "사진 속 사람이 누구인지, 나이나 생김새를 짐작하지 마. 글자가 보이면 쉬운 말로 읽어 줘도 돼.\n"
++    "사진이라는 말 대신 '보여 준 거'처럼 말해.";
++
++// "이거 뭐야?"처럼 눈앞의 물건을 묻는 말인지 (띄어쓰기를 지운 문장으로 비교)
++bool IsVisionRequest(const std::string& compact) {
++    static const char* kWords[] = {"이거뭐야", "이게뭐야", "이건뭐야", "이거뭐게", "이게뭐게", "이거뭔지",
++                                   "이건뭔지", "이거뭐지", "이게뭐지", "뭐가보여", "뭐보여", "이거봐",
++                                   "이것봐", "이거좀봐", "이것좀봐", "보여줄게", "이거무슨", "이건무슨",
++                                   "이거어때", "이거알아", "이게뭔지", "이건뭘까", "이거뭘까"};
++    for (auto w : kWords) {
++        if (compact.find(w) != std::string::npos) return true;
++    }
++    return false;
++}
++
++std::string Base64Encode(const std::string& in) {
++    size_t olen = 0;
++    mbedtls_base64_encode(nullptr, 0, &olen, (const unsigned char*)in.data(), in.size());
++    std::string out(olen, '\0');
++    if (mbedtls_base64_encode((unsigned char*)out.data(), out.size(), &olen,
++                              (const unsigned char*)in.data(), in.size()) != 0) {
++        return "";
++    }
++    out.resize(olen);
++    return out;
++}
 +const char* kTtsUrl = "https://texttospeech.googleapis.com/v1/text:synthesize";
 +const char* kFallbackVoice = "ko-KR-Wavenet-A";  // 설정한 음성이 거부되면 이걸로
 +
@@ -814,6 +928,8 @@ index 0000000..e323730
 +    c.deepgram_key = s.GetString("deepgram_key");
 +    c.deepseek_key = s.GetString("deepseek_key");
 +    c.google_tts_key = s.GetString("gtts_key");
++    c.claude_key = s.GetString("claude_key");
++    c.vision_model = s.GetString("vision_model", CONFIG_DIRECT_VISION_MODEL);
 +    c.llm_model = s.GetString("llm_model", CONFIG_DIRECT_LLM_MODEL);
 +    c.tts_voice = s.GetString("tts_voice", CONFIG_DIRECT_TTS_VOICE);
 +    c.memory = s.GetString("memory");
@@ -1292,10 +1408,10 @@ index 0000000..e323730
 +    EmitJson("stt", "text", text.c_str());
 +    EmitJson("llm", "emotion", "thinking");  // 대답을 기다리는 동안 생각하는 얼굴
 +
++    std::string compact;
++    for (char ch : text) if (ch != ' ') compact.push_back(ch);
 +    // 어른용 음성 명령: "설정 모드" → 설정 화면(Xiaozhi-XXXX, 192.168.4.1)으로
 +    {
-+        std::string compact;
-+        for (char ch : text) if (ch != ' ') compact.push_back(ch);
 +        if (compact.find("설정모드") != std::string::npos) {
 +            ESP_LOGI(TAG, "Voice command: enter config mode");
 +            RequestMemoryUpdate();
@@ -1306,10 +1422,18 @@ index 0000000..e323730
 +        }
 +    }
 +
++    // "이거 뭐야?" → 카메라로 보고 Claude에게 묻는다 (Claude 키가 있을 때만)
++    bool vision = !config_.claude_key.empty() && IsVisionRequest(compact) &&
++                  Board::GetInstance().GetCamera() != nullptr;
++    if (vision) {
++        ESP_LOGI(TAG, "Vision request: %s", text.c_str());
++        EmitJson("llm", "emotion", "surprised");  // 눈을 크게 뜨고 보는 얼굴
++    }
++
 +    uint32_t turn = turn_.fetch_add(1) + 1;
 +    {
 +        std::lock_guard<std::mutex> lock(mutex_);
-+        llm_jobs_.emplace_back(turn, text);
++        llm_jobs_.emplace_back(turn, vision ? std::string(kVisionMarker) + text : text);
 +    }
 +    cv_.notify_all();
 +}
@@ -1331,6 +1455,23 @@ index 0000000..e323730
 +        cJSON_AddStringToObject(m, "content", content.c_str());
 +        cJSON_AddItemToArray(msgs, m);
 +    };
++    add("system", BuildSystemPrompt());
++    {
++        std::lock_guard<std::mutex> lock(history_mutex_);
++        for (auto& h : history_) {
++            add("user", h.first);
++            add("assistant", h.second);
++        }
++    }
++    add("user", user_text);
++    char* s = cJSON_PrintUnformatted(root);
++    std::string body = s ? s : "";
++    if (s) cJSON_free(s);
++    cJSON_Delete(root);
++    return body;
++}
++
++std::string DirectProtocol::BuildSystemPrompt() {
 +    {
 +        std::string sys = kSystemPrompt;
 +        std::string now = CurrentTimeText();
@@ -1351,21 +1492,8 @@ index 0000000..e323730
 +            last_notice_us_ = esp_timer_get_time();
 +            sys += "\n지금 인터넷이 느려서 말을 잘못 알아들었을 수 있어. 이번 대답은 '인터넷이 조금 느린 것 같아.'로 짧게 시작해.";
 +        }
-+        add("system", sys);
++        return sys;
 +    }
-+    {
-+        std::lock_guard<std::mutex> lock(history_mutex_);
-+        for (auto& h : history_) {
-+            add("user", h.first);
-+            add("assistant", h.second);
-+        }
-+    }
-+    add("user", user_text);
-+    char* s = cJSON_PrintUnformatted(root);
-+    std::string body = s ? s : "";
-+    if (s) cJSON_free(s);
-+    cJSON_Delete(root);
-+    return body;
 +}
 +
 +void DirectProtocol::LlmLoop() {
@@ -1414,7 +1542,12 @@ index 0000000..e323730
 +            }
 +            continue;
 +        }
-+        if (IsCurrent(job.first)) RunLlm(job.first, job.second);
++        if (!IsCurrent(job.first)) continue;
++        if (job.second.rfind(kVisionMarker, 0) == 0) {
++            RunVision(job.first, job.second.substr(1));
++        } else {
++            RunLlm(job.first, job.second);
++        }
 +    }
 +}
 +
@@ -1470,8 +1603,117 @@ index 0000000..e323730
 +        return;
 +    }
 +    ESP_LOGI(TAG, "LAT llm_headers=%lld ms", (esp_timer_get_time() - t0) / 1000);
++    StreamReply(turn, http.get(), t0, false, user_text, user_text);
++}
 +
-+    std::string line_buf, text_buf, full_reply;
++// "이거 뭐야?": 카메라로 한 장 찍어 Claude에게 보여 주고, 답을 같은 방식으로 읽어 준다
++void DirectProtocol::RunVision(uint32_t turn, const std::string& user_text) {
++    int64_t t0 = esp_timer_get_time();
++    auto say = [&](const char* text) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        tts_jobs_.push_back({turn, text, true});
++        cv_.notify_all();
++    };
++
++    std::string jpeg;
++    auto camera = Board::GetInstance().GetCamera();
++    if (!camera || !camera->CaptureJpeg(jpeg, 70)) {
++        ESP_LOGE(TAG, "Vision: capture failed");
++        say("앗, 눈이 잘 안 보여. 조금 있다가 다시 보여 줄래?");
++        return;
++    }
++    int64_t t_cap = esp_timer_get_time();
++    if (!IsCurrent(turn)) return;
++
++    std::string b64 = Base64Encode(jpeg);
++    jpeg.clear();
++    jpeg.shrink_to_fit();
++
++    cJSON* root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "model", config_.vision_model.c_str());
++    cJSON_AddNumberToObject(root, "max_tokens", 400);
++    cJSON_AddBoolToObject(root, "stream", true);
++    // 짧은 설명이라 추론은 끈다 (Haiku 5.5는 effort low~high에서 disabled 허용)
++    cJSON* thinking = cJSON_AddObjectToObject(root, "thinking");
++    cJSON_AddStringToObject(thinking, "type", "disabled");
++    cJSON* oc = cJSON_AddObjectToObject(root, "output_config");
++    cJSON_AddStringToObject(oc, "effort", "low");
++    cJSON_AddStringToObject(root, "system", (BuildSystemPrompt() + kVisionPrompt).c_str());
++    cJSON* msgs = cJSON_AddArrayToObject(root, "messages");
++    auto add_text = [msgs](const char* role, const std::string& text) {
++        cJSON* m = cJSON_CreateObject();
++        cJSON_AddStringToObject(m, "role", role);
++        cJSON_AddStringToObject(m, "content", text.c_str());
++        cJSON_AddItemToArray(msgs, m);
++    };
++    {
++        std::lock_guard<std::mutex> lock(history_mutex_);
++        for (auto& h : history_) {
++            add_text("user", h.first);
++            add_text("assistant", h.second);
++        }
++    }
++    {
++        cJSON* m = cJSON_CreateObject();
++        cJSON_AddStringToObject(m, "role", "user");
++        cJSON* content = cJSON_AddArrayToObject(m, "content");
++        cJSON* img = cJSON_CreateObject();
++        cJSON_AddStringToObject(img, "type", "image");
++        cJSON* src = cJSON_AddObjectToObject(img, "source");
++        cJSON_AddStringToObject(src, "type", "base64");
++        cJSON_AddStringToObject(src, "media_type", "image/jpeg");
++        cJSON_AddStringToObject(src, "data", b64.c_str());
++        cJSON_AddItemToArray(content, img);
++        cJSON* txt = cJSON_CreateObject();
++        cJSON_AddStringToObject(txt, "type", "text");
++        cJSON_AddStringToObject(txt, "text", user_text.c_str());
++        cJSON_AddItemToArray(content, txt);
++        cJSON_AddItemToArray(msgs, m);
++    }
++    b64.clear();
++    b64.shrink_to_fit();
++    char* js = cJSON_PrintUnformatted(root);
++    std::string body = js ? js : "";
++    if (js) cJSON_free(js);
++    cJSON_Delete(root);
++    size_t body_size = body.size();
++
++    auto network = Board::GetInstance().GetNetwork();
++    if (!vision_http_) {
++        vision_http_ = network->CreateHttp(4);
++        vision_http_->SetKeepAlive(true);
++    }
++    auto& http = vision_http_;
++    http->SetTimeout(20000);
++    http->SetHeader("x-api-key", config_.claude_key);
++    http->SetHeader("anthropic-version", "2026-10-21");
++    http->SetHeader("Content-Type", "application/json");
++    http->SetHeader("Accept", "text/event-stream");
++    http->SetContent(std::move(body));
++    if (!http->Open("POST", kClaudeUrl)) {
++        ESP_LOGE(TAG, "Claude open failed");
++        http->Close();
++        say("앗, 인터넷이 잘 안 돼서 못 봤어. 다시 보여 줄래?");
++        return;
++    }
++    auto status = http->GetStatusCode();
++    if (!status || *status != 200) {
++        std::string err = http->ReadAll();
++        ESP_LOGE(TAG, "Claude status %d: %.300s", status ? *status : -1, err.c_str());
++        http->Close();
++        say("음, 지금은 잘 안 보여. 조금 있다가 다시 보여 줄래?");
++        return;
++    }
++    ESP_LOGI(TAG, "LAT vision capture=%lld ms headers=%lld ms body=%u bytes",
++             (t_cap - t0) / 1000, (esp_timer_get_time() - t0) / 1000, (unsigned)body_size);
++    StreamReply(turn, http.get(), t0, true, "(카메라로 무언가를 보여 주며) " + user_text,
++                "(무언가를 보여 주며) " + user_text);
++}
++
++void DirectProtocol::StreamReply(uint32_t turn, Http* http, int64_t t0, bool claude,
++                                 const std::string& history_user, const std::string& log_user) {
++
++    std::string line_buf, text_buf, full_reply, stop_reason;
 +    bool emotion_done = false, first_sentence = true, first_token = true;
 +    size_t reasoning_chars = 0;  // 생각(추론) 단계가 있는 모델이면 여기로 먼저 온다
 +    char buf[512];
@@ -1504,18 +1746,46 @@ index 0000000..e323730
 +            line_buf.erase(0, pos + 1);
 +            if (line.rfind("data:", 0) != 0) continue;  // ": keep-alive" 등
 +            std::string payload = Trim(line.substr(5));
-+            if (payload == "[DONE]") {
++            if (!claude && payload == "[DONE]") {
 +                done = true;
 +                break;
 +            }
 +            cJSON* j = cJSON_Parse(payload.c_str());
 +            if (!j) continue;
-+            auto choices = cJSON_GetObjectItem(j, "choices");
-+            auto c0 = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
-+            auto delta = c0 ? cJSON_GetObjectItem(c0, "delta") : nullptr;
-+            auto content = delta ? cJSON_GetObjectItem(delta, "content") : nullptr;
-+            auto reasoning = delta ? cJSON_GetObjectItem(delta, "reasoning_content") : nullptr;
-+            if (cJSON_IsString(reasoning)) reasoning_chars += strlen(reasoning->valuestring);
++            cJSON* content = nullptr;
++            if (claude) {
++                // Claude: content_block_delta(text_delta)에 글자가 오고 message_stop으로 끝난다
++                auto type = cJSON_GetObjectItem(j, "type");
++                const char* t = cJSON_IsString(type) ? type->valuestring : "";
++                if (strcmp(t, "content_block_delta") == 0) {
++                    auto delta = cJSON_GetObjectItem(j, "delta");
++                    auto dtype = delta ? cJSON_GetObjectItem(delta, "type") : nullptr;
++                    if (cJSON_IsString(dtype) && strcmp(dtype->valuestring, "text_delta") == 0) {
++                        content = cJSON_GetObjectItem(delta, "text");
++                    }
++                } else if (strcmp(t, "message_delta") == 0) {
++                    auto delta = cJSON_GetObjectItem(j, "delta");
++                    auto sr = delta ? cJSON_GetObjectItem(delta, "stop_reason") : nullptr;
++                    if (cJSON_IsString(sr)) {
++                        stop_reason = sr->valuestring;
++                        if (stop_reason != "end_turn") ESP_LOGW(TAG, "Claude stop_reason=%s", sr->valuestring);
++                    }
++                } else if (strcmp(t, "message_stop") == 0) {
++                    done = true;
++                } else if (strcmp(t, "error") == 0) {
++                    char* e = cJSON_PrintUnformatted(j);
++                    ESP_LOGE(TAG, "Claude stream error: %.200s", e ? e : "");
++                    if (e) cJSON_free(e);
++                    done = true;
++                }
++            } else {
++                auto choices = cJSON_GetObjectItem(j, "choices");
++                auto c0 = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
++                auto delta = c0 ? cJSON_GetObjectItem(c0, "delta") : nullptr;
++                content = delta ? cJSON_GetObjectItem(delta, "content") : nullptr;
++                auto reasoning = delta ? cJSON_GetObjectItem(delta, "reasoning_content") : nullptr;
++                if (cJSON_IsString(reasoning)) reasoning_chars += strlen(reasoning->valuestring);
++            }
 +            if (cJSON_IsString(content) && content->valuestring[0]) {
 +                if (first_token) {
 +                    first_token = false;
@@ -1571,6 +1841,11 @@ index 0000000..e323730
 +        http->Close();
 +    }
 +    full_reply += text_buf;
++    if (claude && Trim(full_reply).empty()) {
++        // 거절(refusal)이나 오류로 아무 말도 못 받았을 때
++        ESP_LOGW(TAG, "Claude gave no text (stop_reason=%s)", stop_reason.c_str());
++        text_buf = "[thinking] 음, 이건 잘 모르겠어. 다른 걸 보여 줄래?";
++    }
 +    push_sentence(text_buf, true);
 +    ESP_LOGI(TAG, "LAT llm_total=%lld ms", (esp_timer_get_time() - t0) / 1000);
 +
@@ -1578,12 +1853,12 @@ index 0000000..e323730
 +    ESP_LOGI(TAG, "<< %s", reply.c_str());
 +    if (!reply.empty() && IsCurrent(turn)) {
 +        std::lock_guard<std::mutex> lock(history_mutex_);
-+        history_.emplace_back(user_text, reply);
++        history_.emplace_back(history_user, reply);
 +        while (history_.size() > kHistoryTurns) history_.pop_front();
 +    }
 +    if (!reply.empty()) {
 +        std::lock_guard<std::mutex> lock(memory_mutex_);
-+        session_log_.push_back("아이: " + user_text);
++        session_log_.push_back("아이: " + log_user);
 +        session_log_.push_back("스택짱: " + reply);
 +        while (session_log_.size() > 40) session_log_.erase(session_log_.begin());
 +    }
@@ -1936,10 +2211,10 @@ index 0000000..e323730
 +}
 diff --git a/main/protocols/direct_protocol.h b/main/protocols/direct_protocol.h
 new file mode 100644
-index 0000000..a57a64c
+index 0000000..47b8371
 --- /dev/null
 +++ b/main/protocols/direct_protocol.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,165 @@
 +// direct-cloud: 서버 없이 기기에서 Deepgram(ASR) / DeepSeek(LLM) / Google TTS를 직접 호출한다.
 +// 기존 Protocol 인터페이스를 그대로 구현하므로 Application 쪽 흐름(상태, 표정, 재생)은 바뀌지 않는다.
 +#ifndef DIRECT_PROTOCOL_H
@@ -1964,6 +2239,8 @@ index 0000000..a57a64c
 +    std::string deepgram_key;
 +    std::string deepseek_key;
 +    std::string google_tts_key;
++    std::string claude_key;    // 사진 보기(Claude). 없으면 사진 기능만 꺼진다
++    std::string vision_model;
 +    std::string llm_model;
 +    std::string tts_voice;
 +    std::string memory;  // 아이에 대한 기억 메모 (NVS "memory")
@@ -2075,6 +2352,7 @@ index 0000000..a57a64c
 +    std::atomic<bool> thinking_param_ok_{true};
 +    std::unique_ptr<Http> llm_http_;
 +    std::unique_ptr<Http> tts_http_;
++    std::unique_ptr<Http> vision_http_;
 +
 +    bool SendText(const std::string& text) override;
 +    bool IsTimeout() const override { return false; }
@@ -2087,6 +2365,11 @@ index 0000000..a57a64c
 +    void TtsLoop();
 +    void PlayerLoop();
 +    void RunLlm(uint32_t turn, const std::string& user_text);
++    void RunVision(uint32_t turn, const std::string& user_text);
++    // 스트리밍 답변을 읽어 문장마다 TTS로 넘기고 대화 기록에 남긴다 (DeepSeek / Claude 공용)
++    void StreamReply(uint32_t turn, Http* http, int64_t t0, bool claude,
++                     const std::string& history_user, const std::string& log_user);
++    std::string BuildSystemPrompt();
 +    bool Synthesize(uint32_t turn, const std::string& text, bool last, const std::string& emotion = "");
 +    bool IsCurrent(uint32_t turn) const { return turn == turn_.load(); }
 +    std::string BuildLlmBody(const std::string& user_text);

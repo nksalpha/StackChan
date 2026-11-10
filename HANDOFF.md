@@ -2,7 +2,7 @@
 
 새 세션에서 이어갈 때 이 파일부터 읽고 시작한다.
 
-마지막 갱신: 2026-11-05
+마지막 갱신: 2026-11-10
 
 ## 목표
 
@@ -60,6 +60,14 @@
     Google keep-alive(HTTP/1.1 기본값), DeepSeek 추론 끄기(thinking disabled), 원음(PCM) 업로드, 말 끝 판정 1.0초/endpointing 800ms
   - 다음 후보: 첫 문장을 더 짧게 끊어 TTS 시작 앞당기기, 말 끝 판정 0.7~0.8초 시험, Chirp vs WaveNet 속도/음질 선택
   - 참고: NAS 서버도 같은 deepseek-flash라 추론 끄기를 서버에 적용하면 서버 방식도 1초 이상 빨라질 가능성
+
+## 사진 보기 (2026-11-10)
+
+- "이거 뭐야?" 류의 말이면 카메라로 한 장 찍어 Claude Haiku 5.5(`claude-haiku-5-5`, 추론 끔, effort low, 스트리밍)에게 묻는다. 나머지 대화는 DeepSeek 그대로
+- 비용은 사용자의 Max 플랜 API 크레딧(월 $100)으로 충당. 키는 설정 화면의 Claude API 키 칸(NVS `direct/claude_key`)
+- 코드: `RunVision`, 공용 스트리밍 처리 `StreamReply`(DeepSeek/Claude SSE 둘 다), 카메라 `Camera::CaptureJpeg`
+- 기기 테스트 전. 확인할 것: 카메라 방향, `LAT vision` 시간, 거절 처리
+- 다음 후보: 기기 안 얼굴 감지(B), 일반 대화도 Claude로 바꿀지 속도 비교
 
 ## 측정 도구 (2026-11-05 추가, 서버 로그용)
 

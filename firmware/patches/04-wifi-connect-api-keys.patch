@@ -1,7 +1,7 @@
 diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b/assets/wifi_configuration.html
---- a/assets/wifi_configuration.html	2026-11-06 01:04:26.391156182 +0000
-+++ b/assets/wifi_configuration.html	2026-11-07 15:22:58.795332206 +0000
-@@ -534,9 +534,29 @@
+--- a/assets/wifi_configuration.html	2026-11-10 07:54:03.331351456 +0000
++++ b/assets/wifi_configuration.html	2026-11-10 07:54:03.339096067 +0000
+@@ -534,9 +534,31 @@
                      <label for="password" data-lang="password">Password:</label>
                      <input type="password" id="password" name="password">
                  </p>
@@ -13,6 +13,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                    <input type="password" id="deepseek_key" name="deepseek_key" autocomplete="off" autocapitalize="off" spellcheck="false">
 +                    <label for="gtts_key">Google TTS API 키 <span id="gtts_state" class="key-state"></span></label>
 +                    <input type="password" id="gtts_key" name="gtts_key" autocomplete="off" autocapitalize="off" spellcheck="false">
++                    <label for="claude_key">Claude API 키 (사진 보기, 선택) <span id="claude_state" class="key-state"></span></label>
++                    <input type="password" id="claude_key" name="claude_key" autocomplete="off" autocapitalize="off" spellcheck="false">
 +                    <p style="font-size: 12px; opacity: 0.7;">비워 두면 저장된 키를 그대로 씁니다.</p>
 +                    <label for="tts_voice">TTS 음성 이름</label>
 +                    <input type="text" id="tts_voice" name="tts_voice" placeholder="ko-KR-Chirp3-HD-Achernar" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -31,7 +33,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
              </form>
              <div id="ap_list"></div>
          </div>
-@@ -1606,6 +1626,34 @@
+@@ -1606,6 +1628,34 @@
          /**
           * Submit Wi-Fi connection form
           */
@@ -40,7 +42,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +        // direct-cloud: Wi-Fi는 그대로 두고 키만 저장
 +        async function saveKeysOnly() {
 +            const keys = {};
-+            for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'tts_voice']) {
++            for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'claude_key', 'tts_voice']) {
 +                const v = document.getElementById(k).value.trim();
 +                if (v) keys[k] = v;
 +            }
@@ -54,7 +56,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
 +                });
 +                const d = await r.json();
 +                if (!d.success) throw new Error();
-+                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key']) document.getElementById(k).value = '';
++                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'claude_key']) document.getElementById(k).value = '';
 +                loadAdvancedConfig();
 +                memoryDirty = false;
 +                showToast('저장했어요');
@@ -66,13 +68,13 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
          async function submitForm(event) {
              event.preventDefault();
              button.disabled = true;
-@@ -1621,6 +1669,22 @@
+@@ -1621,6 +1671,22 @@
              };
  
              try {
 +                // direct-cloud: API 키를 먼저 저장하고 Wi-Fi에 연결한다
 +                const keys = {};
-+                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'tts_voice']) {
++                for (const k of ['deepgram_key', 'deepseek_key', 'gtts_key', 'claude_key', 'tts_voice']) {
 +                    const v = document.getElementById(k).value.trim();
 +                    if (v) keys[k] = v;
 +                }
@@ -89,11 +91,11 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
                  const response = await fetch('/submit', {
                      method: 'POST',
                      headers: {
-@@ -1749,6 +1813,12 @@
+@@ -1749,6 +1815,12 @@
                  if (data.sleep_mode !== undefined) {
                      document.getElementById('sleep_mode').checked = data.sleep_mode;
                  }
-+                for (const k of ['deepgram', 'deepseek', 'gtts']) {
++                for (const k of ['deepgram', 'deepseek', 'gtts', 'claude']) {
 +                    const el = document.getElementById(k + '_state');
 +                    if (el) el.textContent = data[k + '_set'] ? '(저장됨)' : '(없음)';
 +                }
@@ -103,8 +105,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/assets/wifi_configuration.html b
                  console.error('Error loading advanced config:', error);
              }
 diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_configuration_ap.cc
---- a/wifi_configuration_ap.cc	2026-11-06 01:04:26.388940730 +0000
-+++ b/wifi_configuration_ap.cc	2026-11-07 15:22:44.714696406 +0000
+--- a/wifi_configuration_ap.cc	2026-11-10 07:54:03.206888916 +0000
++++ b/wifi_configuration_ap.cc	2026-11-10 07:54:03.337208047 +0000
 @@ -1,5 +1,7 @@
  #include "wifi_configuration_ap.h"
  #include <cstdio>
@@ -113,7 +115,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
  #include <memory>
  #include <freertos/FreeRTOS.h>
  #include <freertos/event_groups.h>
-@@ -533,6 +535,36 @@
+@@ -533,6 +535,37 @@
              cJSON_AddBoolToObject(json, "show_ota_config", this_->show_ota_config_);
              cJSON_AddBoolToObject(json, "show_sleep_config", this_->show_sleep_config_);
  
@@ -122,7 +124,8 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
 +                nvs_handle_t dnvs;
 +                const char* keys[][2] = {{"deepgram_key", "deepgram_set"},
 +                                         {"deepseek_key", "deepseek_set"},
-+                                         {"gtts_key", "gtts_set"}};
++                                         {"gtts_key", "gtts_set"},
++                                         {"claude_key", "claude_set"}};
 +                bool opened = nvs_open("direct", NVS_READONLY, &dnvs) == ESP_OK;
 +                for (auto& k : keys) {
 +                    size_t len = 0;
@@ -150,7 +153,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
              // 发送JSON响应
              char *json_str = cJSON_PrintUnformatted(json);
              cJSON_Delete(json);
-@@ -558,7 +590,7 @@
+@@ -558,7 +591,7 @@
          .handler = [](httpd_req_t *req) -> esp_err_t {
              char *buf;
              size_t buf_len = req->content_len;
@@ -159,7 +162,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
                  httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
                  return ESP_FAIL;
              }
-@@ -601,6 +633,41 @@
+@@ -601,6 +634,42 @@
                  return ESP_FAIL;
              }
  
@@ -168,6 +171,7 @@ diff -ru -x CHECKSUMS.json -x .component_hash a/wifi_configuration_ap.cc b/wifi_
 +                const char* fields[][2] = {{"deepgram_key", "deepgram_key"},
 +                                           {"deepseek_key", "deepseek_key"},
 +                                           {"gtts_key", "gtts_key"},
++                                           {"claude_key", "claude_key"},
 +                                           {"tts_voice", "tts_voice"}};
 +                nvs_handle_t dnvs;
 +                if (nvs_open("direct", NVS_READWRITE, &dnvs) == ESP_OK) {
