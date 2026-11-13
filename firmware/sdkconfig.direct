@@ -966,6 +966,7 @@ CONFIG_DIRECT_CLOUD_MODE=y
 CONFIG_DIRECT_LLM_MODEL="deepseek-flash"
 # default:
 CONFIG_DIRECT_TTS_VOICE="ko-KR-Chirp3-HD-Achernar"
+CONFIG_DIRECT_VISION_MODEL="claude-haiku-5-5"
 # default:
 CONFIG_OTA_URL="https://nams-nas.tail187299.ts.net/xiaozhi/ota/"
 # CONFIG_FLASH_NONE_ASSETS is not set
